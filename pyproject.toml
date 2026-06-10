@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oblivion2vmf"
+version = "0.1.0"
+description = "Convert Oblivion (TES4) terrain heightmaps into Source/Hammer VMF displacement maps for Garry's Mod"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["oblivion", "tes4", "source-engine", "hammer", "vmf", "garrys-mod", "displacement"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment",
+]
+dependencies = []   # core (terrain + textures) is stdlib only
+
+[project.scripts]
+oblivion2vmf = "oblivion2vmf.cli:main"
+oblivion2vmf-gui = "oblivion2vmf.gui:main"
+
+[project.optional-dependencies]
+# Needed only for --models (NIF mesh parsing). PyFFI 2.2.3 calls the removed
+# time.clock(); oblivion2vmf.nif shims it before import, so 3.10 works.
+models = ["pyffi>=2.2.3"]
+# Needed only for --collision acd (accurate walk-in building collision).
+collision = ["coacd>=1.0"]
+# Needed for high-quality prop LODs. pyfqmr is preferred (preserve_border keeps
+# Oblivion's open-shell silhouettes intact); fast-simplification is a fallback.
+# Without either, LODs fall back to crude vertex clustering (or use --no-model-lods).
+lods = ["pyfqmr>=0.2.0", "fast-simplification>=0.1.7"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
