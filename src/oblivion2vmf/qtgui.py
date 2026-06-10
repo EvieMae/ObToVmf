@@ -99,6 +99,46 @@ def _terrain_args(v, plugins, bsas):
 
 
 # --------------------------------------------------------------------------- #
+#  rotation helpers (XYZ euler degrees <-> 3x3 matrices) for the hull gizmo   #
+# --------------------------------------------------------------------------- #
+def _euler_deg_to_matrix(rot):
+    """XYZ-order euler degrees -> 3x3 rotation (R = Rz @ Ry @ Rx)."""
+    rx, ry, rz = (np.radians(float(a)) for a in rot[:3])
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    mx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    my = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    mz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return mz @ my @ mx
+
+
+def _matrix_to_euler_deg(m):
+    """3x3 rotation -> XYZ-order euler degrees (inverse of _euler_deg_to_matrix)."""
+    sy = max(-1.0, min(1.0, -float(m[2, 0])))
+    ry = np.arcsin(sy)
+    if abs(sy) < 0.999999:
+        rx = np.arctan2(m[2, 1], m[2, 2])
+        rz = np.arctan2(m[1, 0], m[0, 0])
+    else:                                       # gimbal lock: fold rz into rx
+        rx = np.arctan2(-m[1, 2], m[1, 1])
+        rz = 0.0
+    return [float(np.degrees(a)) for a in (rx, ry, rz)]
+
+
+def _rotated_part(part, rot, center):
+    """Rotate a (verts, faces) hull about `center` — local fallback for builds of
+    hull_from_spec that don't understand a "rot" key yet."""
+    if part is None or not any(float(a) for a in rot):
+        return part
+    verts, faces = part
+    m = _euler_deg_to_matrix(rot)
+    c = np.asarray(center, dtype=float)
+    v = (np.asarray(verts, dtype=float) - c) @ m.T + c
+    return [tuple(p) for p in v], faces
+
+
+# --------------------------------------------------------------------------- #
 #  main window                                                                #
 # --------------------------------------------------------------------------- #
 class Main(QtWidgets.QMainWindow):
@@ -121,6 +161,8 @@ class Main(QtWidgets.QMainWindow):
         self.cap_buf = ""
         self.cap_done = None
         self.boxes = []            # [{widget, bounds}] active hull widgets
+        self._selected_hull = None  # index into self.boxes (gizmo target)
+        self._gizmo = None          # the single affine-transform widget
         self.acd_actors = []       # named actors of the current ACD preview
         self.cur_model = None      # nif currently loaded in the 3D view
         self._undo_stack = []      # pre-mutation hull snapshots (Ctrl+Z)
@@ -810,7 +852,8 @@ class Main(QtWidgets.QMainWindow):
             s = self._hull_spec(h)
             if len(s["bounds"]) == 6:
                 self._spawn_box(self._to_vtk_bounds(s["bounds"]), s["type"],
-                                s["axis"], s["top_scale"], sides=s["sides"])
+                                s["axis"], s["top_scale"], sides=s["sides"],
+                                rot=s["rot"])
         if self.model_rows[modl].get("acd_parts"):
             self._show_acd(self.model_rows[modl]["acd_parts"])
         self._grid()
@@ -984,34 +1027,47 @@ class Main(QtWidgets.QMainWindow):
         return {"type": "box", "bounds": [float(c) for c in entry[:6]],
                 "axis": "+x", "top_scale": 0.5, "sides": 12, "rot": [0.0, 0.0, 0.0]}
 
-    def _spawn_box(self, vtk_bounds, shape="box", axis="+x", top_scale=0.5, sides=12):
-        entry = {"widget": None, "bounds": vtk_bounds, "type": shape, "axis": axis,
+    def _spawn_box(self, vtk_bounds, shape="box", axis="+x", top_scale=0.5, sides=12,
+                   rot=(0, 0, 0)):
+        if self.plotter is None:
+            return
+        entry = {"widget": None, "bounds": tuple(vtk_bounds), "type": shape, "axis": axis,
                  "top_scale": top_scale, "sides": sides,
-                 "name": "hullprev_%d" % len(self.boxes)}
-
-        def cb(box, widget):
-            nb = tuple(box.bounds)
-            if nb != tuple(entry["bounds"]):   # one snapshot per completed drag
-                self._push_undo()              # entry still holds pre-drag bounds
-                entry["bounds"] = nb
-            self._update_hull_preview(entry)
-        w = self.plotter.add_box_widget(cb, bounds=vtk_bounds, rotation_enabled=False,
-                                        pass_widget=True,
-                                        color=self._SHAPE_COLORS.get(shape, "#46c0ff"))
-        entry["widget"] = w
+                 "rot": [float(a) for a in (list(rot) + [0, 0, 0])[:3]],
+                 "actor": None, "name": "hullprev_%d" % len(self.boxes)}
         self.boxes.append(entry)
         self._update_hull_preview(entry)
 
+    def _hull_part(self, spec):
+        """hull_from_spec with rotation applied; if the model-side helper ignores
+        the "rot" key (older build), rotate the verts locally instead."""
+        rot = spec.get("rot") or [0, 0, 0]
+        part = hull_from_spec(spec)
+        if part is None or not any(float(a) for a in rot):
+            return part
+        plain = hull_from_spec({k: v for k, v in spec.items() if k != "rot"})
+        try:
+            same = plain is not None and np.allclose(
+                np.asarray(part[0], dtype=float), np.asarray(plain[0], dtype=float))
+        except Exception:
+            same = False
+        if same:                                  # "rot" was ignored — rotate here
+            b = spec["bounds"]
+            ctr = ((b[0] + b[3]) / 2.0, (b[1] + b[4]) / 2.0, (b[2] + b[5]) / 2.0)
+            part = _rotated_part(part, rot, ctr)
+        return part
+
     def _update_hull_preview(self, entry):
-        """Draw the actual wedge/trapezium inside its box-gizmo envelope (the box
-        widget itself is the shape for type 'box')."""
-        if entry["type"] == "box":
+        """(Re)draw the hull as a translucent named mesh actor — every shape, boxes
+        included, since the affine gizmo attaches to this actor."""
+        if self.plotter is None:
             return
-        part = hull_from_spec({"type": entry["type"],
-                               "bounds": self._from_vtk_bounds(entry["bounds"]),
-                               "axis": entry["axis"], "top_scale": entry["top_scale"],
-                               "sides": entry.get("sides", 12)})
-        if part is None:                       # shape not buildable yet — keep the gizmo
+        part = self._hull_part({"type": entry["type"],
+                                "bounds": self._from_vtk_bounds(entry["bounds"]),
+                                "axis": entry["axis"], "top_scale": entry["top_scale"],
+                                "sides": entry.get("sides", 12),
+                                "rot": entry.get("rot") or [0, 0, 0]})
+        if part is None:                       # shape not buildable — drop stale actor
             try:
                 self.plotter.remove_actor(entry["name"])
             except Exception:
@@ -1020,8 +1076,91 @@ class Main(QtWidgets.QMainWindow):
         verts, faces = part
         mesh = pv.PolyData(np.array(verts, dtype=float),
                            np.hstack([[3, *f] for f in faces]).astype(np.int64))
-        self.plotter.add_mesh(mesh, name=entry["name"], opacity=0.45, show_edges=True,
-                              color=self._SHAPE_COLORS.get(entry["type"], "#80cbc4"))
+        sel = (self._selected_hull is not None
+               and self._selected_hull < len(self.boxes)
+               and self.boxes[self._selected_hull] is entry)
+        try:
+            entry["actor"] = self.plotter.add_mesh(
+                mesh, name=entry["name"], opacity=0.7 if sel else 0.45,
+                show_edges=True, edge_color="#ffffff" if sel else "#0b1b3a",
+                color=self._SHAPE_COLORS.get(entry["type"], "#80cbc4"))
+        except Exception:
+            pass
+
+    # ---- hull selection + affine gizmo ----
+    def _detach_gizmo(self):
+        """Tear down the affine widget; VTK can throw if GL is half-gone."""
+        g, self._gizmo = self._gizmo, None
+        if g is None:
+            return
+        for meth in ("disable", "Off", "remove"):
+            try:
+                getattr(g, meth)()
+            except Exception:
+                pass
+
+    def _select_hull(self, i):
+        """Make hull i current: highlight it and attach the Blender-style gizmo."""
+        if self.plotter is None:
+            return
+        self._detach_gizmo()
+        self._selected_hull = i if (i is not None and 0 <= i < len(self.boxes)) else None
+        for e in self.boxes:                      # refresh highlight on every hull
+            self._update_hull_preview(e)
+        if self._selected_hull is not None:
+            actor = self.boxes[self._selected_hull].get("actor")
+            if actor is not None:
+                try:
+                    self._gizmo = self.plotter.add_affine_transform_widget(
+                        actor, release_callback=self._on_gizmo_release)
+                except Exception:
+                    self._gizmo = None
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+
+    def _on_gizmo_release(self, *_args):
+        """Bake the gizmo's transform into the hull spec: the bounds shift so their
+        centre lands where the actor's did, rotation accumulates into entry["rot"]
+        (matrix-composed so repeated drags stay correct), then the actor is rebuilt
+        clean with an identity user_matrix."""
+        i = self._selected_hull
+        if i is None or not (0 <= i < len(self.boxes)):
+            return
+        entry = self.boxes[i]
+        actor = entry.get("actor")
+        if actor is None:
+            return
+        try:
+            m = np.array(actor.user_matrix, dtype=float).reshape(4, 4)
+        except Exception:
+            return
+        if np.allclose(m, np.eye(4)):
+            return
+        self._push_undo()                         # entry still holds pre-drag state
+        r = m[:3, :3].copy()
+        for c in range(3):                        # strip any scale the widget added
+            n = float(np.linalg.norm(r[:, c]))
+            if n > 1e-9:
+                r[:, c] /= n
+        vb = entry["bounds"]
+        ctr = np.array([(vb[0] + vb[1]) / 2.0, (vb[2] + vb[3]) / 2.0,
+                        (vb[4] + vb[5]) / 2.0])
+        # the widget rotates about its own origin, so map the hull centre through
+        # the full affine (pure translation reduces this to t = m[:3, 3])
+        t = r @ ctr + m[:3, 3] - ctr
+        entry["bounds"] = (vb[0] + t[0], vb[1] + t[0], vb[2] + t[1],
+                           vb[3] + t[1], vb[4] + t[2], vb[5] + t[2])
+        old = entry.get("rot") or [0, 0, 0]
+        entry["rot"] = _matrix_to_euler_deg(r @ _euler_deg_to_matrix(old))
+        try:
+            actor.user_matrix = np.eye(4)
+        except Exception:
+            pass
+        # rebuild actor + reattach gizmo, deferred so the widget isn't torn down
+        # from inside its own VTK release observer
+        QtCore.QTimer.singleShot(0, lambda: self._select_hull(i))
 
     def _default_box_bounds(self):
         x0, y0, z0, x1, y1, z1 = getattr(self, "bb", (0, 0, 0, 64, 64, 64))
@@ -1035,13 +1174,23 @@ class Main(QtWidgets.QMainWindow):
                         axis=self.wedge_axis.currentText(),
                         top_scale=float(self.trap_top.value()),
                         sides=int(self.cyl_sides.currentText()))
+        self._select_hull(len(self.boxes) - 1)    # new hull grabs the gizmo
         self.plotter.render()
         self._refresh_inspector()
+
+    def _hull_target(self):
+        """Index the hull buttons act on: the selected hull, else the last one."""
+        i = self._selected_hull
+        if i is not None and 0 <= i < len(self.boxes):
+            return i
+        return len(self.boxes) - 1
 
     def _remove_box(self):
         if self.plotter is not None and self.boxes:
             self._push_undo()
-            gone = self.boxes.pop()                # drop the most recently added
+            self._detach_gizmo()
+            gone = self.boxes.pop(self._hull_target())
+            self._selected_hull = None
             try:
                 self.plotter.remove_actor(gone["name"])
             except Exception:
@@ -1052,11 +1201,13 @@ class Main(QtWidgets.QMainWindow):
     def _fit_box(self):
         if self.plotter is not None and self.boxes and hasattr(self, "bb"):
             self._push_undo()
-            self.boxes[-1]["bounds"] = (self.bb[0], self.bb[3], self.bb[1],
-                                        self.bb[4], self.bb[2], self.bb[5])
+            i = self._hull_target()
+            self.boxes[i]["bounds"] = (self.bb[0], self.bb[3], self.bb[1],
+                                       self.bb[4], self.bb[2], self.bb[5])
             self._respawn_boxes()
 
     def _clear_boxes(self):
+        self._detach_gizmo()
         if _HAVE_3D and self.plotter is not None:
             try:
                 self.plotter.clear_box_widgets()
@@ -1068,14 +1219,20 @@ class Main(QtWidgets.QMainWindow):
                 except Exception:
                     pass
         self.boxes = []
+        self._selected_hull = None
 
     def _respawn_boxes(self):
-        """Rebuild all widgets + previews from current state (after add/remove)."""
-        specs = [(e["bounds"], e["type"], e["axis"], e["top_scale"], e.get("sides", 12))
-                 for e in self.boxes]
+        """Rebuild all preview actors from current state (after add/remove)."""
+        if self.plotter is None:
+            return
+        sel = self._selected_hull
+        specs = [(e["bounds"], e["type"], e["axis"], e["top_scale"], e.get("sides", 12),
+                  e.get("rot") or [0, 0, 0]) for e in self.boxes]
         self._clear_boxes()
-        for vb, t, ax, ts, sd in specs:
-            self._spawn_box(vb, t, ax, ts, sides=sd)
+        for vb, t, ax, ts, sd, rot in specs:
+            self._spawn_box(vb, t, ax, ts, sides=sd, rot=rot)
+        if sel is not None and 0 <= sel < len(self.boxes):
+            self._select_hull(sel)
         self.plotter.render()
 
     # ---- hull undo/redo ----
@@ -1109,7 +1266,8 @@ class Main(QtWidgets.QMainWindow):
             bounds = tuple(s.get("bounds", ()))
             if self.plotter is not None:
                 self._spawn_box(bounds, s.get("type", "box"), s.get("axis", "+x"),
-                                s.get("top_scale", 0.5), sides=s.get("sides", 12))
+                                s.get("top_scale", 0.5), sides=s.get("sides", 12),
+                                rot=s.get("rot", (0, 0, 0)))
             else:
                 e = dict(s)
                 e["bounds"] = bounds
@@ -1160,18 +1318,25 @@ class Main(QtWidgets.QMainWindow):
         hulls = []
         for e in self.boxes:
             b = [round(float(c), 2) for c in self._from_vtk_bounds(e["bounds"])]
+            rot = [round(float(a), 2) for a in (e.get("rot") or [0, 0, 0])]
             if e["type"] == "box":
-                hulls.append(b)                    # legacy compact form
-            elif e["type"] == "wedge":
-                hulls.append({"type": "wedge", "bounds": b, "axis": e["axis"]})
+                if any(rot):                       # rotated box needs the dict form
+                    hulls.append({"type": "box", "bounds": b, "rot": rot})
+                else:
+                    hulls.append(b)                # legacy compact form
+                continue
+            if e["type"] == "wedge":
+                d = {"type": "wedge", "bounds": b, "axis": e["axis"]}
             elif e["type"] == "cylinder":
-                hulls.append({"type": "cylinder", "bounds": b,
-                              "sides": int(e.get("sides", 12))})
+                d = {"type": "cylinder", "bounds": b, "sides": int(e.get("sides", 12))}
             elif e["type"] == "plane":
-                hulls.append({"type": "plane", "bounds": b})
+                d = {"type": "plane", "bounds": b}
             else:
-                hulls.append({"type": "trap", "bounds": b,
-                              "top_scale": round(float(e["top_scale"]), 3)})
+                d = {"type": "trap", "bounds": b,
+                     "top_scale": round(float(e["top_scale"]), 3)}
+            if any(rot):
+                d["rot"] = rot
+            hulls.append(d)
         self.model_rows[self.cur_model]["hulls"] = hulls
         if hulls:
             self.model_rows[self.cur_model]["collision"].setCurrentText("hulls")
