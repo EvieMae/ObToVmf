@@ -212,11 +212,63 @@ def trap_hull(bounds, top_scale=0.5):
     return (verts, list(_BOX_FACES))
 
 
+def cylinder_hull(bounds, sides=12):
+    """An n-sided prism approximating the cylinder inscribed in ``bounds``: the
+    XY-footprint ellipse extruded from z0 to z1. One convex hull; sides clamps to
+    >= 3 so the part always has volume."""
+    x0, y0, z0, x1, y1, z1 = bounds
+    n = max(3, int(sides))
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    rx, ry = (x1 - x0) / 2.0, (y1 - y0) / 2.0
+    ring = [(cx + rx * math.cos(2 * math.pi * i / n),
+             cy + ry * math.sin(2 * math.pi * i / n)) for i in range(n)]
+    verts = [(x, y, z0) for x, y in ring] + [(x, y, z1) for x, y in ring]
+    faces = []
+    for i in range(n):                      # side quads (two tris each)
+        j = (i + 1) % n
+        faces.append((i, j, n + j))
+        faces.append((i, n + j, n + i))
+    for i in range(1, n - 1):               # caps as fans (reference every vert)
+        faces.append((0, i + 1, i))                          # bottom
+        faces.append((n, n + i, n + i + 1))                  # top
+    return (verts, faces)
+
+
+def plane_hull(bounds, thickness=2.0):
+    """A thin slab over the bounds XY footprint, from z0 to z0+thickness. Convex
+    physics pieces need volume — a zero-thickness quad is degenerate for
+    studiomdl — so 'plane' really means 'very flat box'."""
+    x0, y0, z0, x1, y1, _ = bounds
+    t = max(0.1, float(thickness))
+    return box_hull((x0, y0, z0, x1, y1, z0 + t))
+
+
+def _rotate_verts(verts, rot, centre):
+    """Rotate verts about ``centre`` by Euler angles rot=[rx,ry,rz] in degrees,
+    intrinsic XYZ order, right-handed (== world-axis Z then Y then X). Pure math
+    so hull specs don't drag in numpy."""
+    rx, ry, rz = (math.radians(float(a)) for a in rot)
+    cx_, sx = math.cos(rx), math.sin(rx)
+    cy_, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    ox, oy, oz = centre
+    out = []
+    for x, y, z in verts:
+        x, y, z = x - ox, y - oy, z - oz
+        x, y = x * cz - y * sz, x * sz + y * cz          # about world Z
+        x, z = x * cy_ + z * sy, -x * sy + z * cy_       # about world Y
+        y, z = y * cx_ - z * sx, y * sx + z * cx_        # about world X
+        out.append((x + ox, y + oy, z + oz))
+    return out
+
+
 def hull_from_spec(spec):
     """One convex collision part from a hull spec. Accepts the legacy 6-float box
-    list, or a dict {"type": "box"|"wedge"|"trap", "bounds": [x0,y0,z0,x1,y1,z1],
-    "axis": "+x" (wedge), "top_scale": 0.5 (trap)}. Returns (verts, faces) or
-    None for a malformed spec."""
+    list, or a dict {"type": "box"|"wedge"|"trap"|"cylinder"|"plane",
+    "bounds": [x0,y0,z0,x1,y1,z1], "axis": "+x" (wedge), "top_scale": 0.5 (trap),
+    "sides": 12 (cylinder), "thickness": 2.0 (plane), "rot": [rx,ry,rz] degrees
+    (any dict shape, about the bounds centre)}. Returns (verts, faces) or None
+    for a malformed spec."""
     if isinstance(spec, dict):
         b = spec.get("bounds") or []
         if len(b) != 6:
@@ -224,10 +276,28 @@ def hull_from_spec(spec):
         b = tuple(float(c) for c in b)
         t = (spec.get("type") or "box").lower()
         if t == "wedge":
-            return ramp_hull(b, spec.get("axis", "+x"))
-        if t in ("trap", "trapezoid", "trapezium"):
-            return trap_hull(b, spec.get("top_scale", 0.5))
-        return box_hull(b)
+            part = ramp_hull(b, spec.get("axis", "+x"))
+        elif t in ("trap", "trapezoid", "trapezium"):
+            part = trap_hull(b, spec.get("top_scale", 0.5))
+        elif t == "cylinder":
+            part = cylinder_hull(b, spec.get("sides", 12))
+        elif t == "plane":
+            part = plane_hull(b, spec.get("thickness", 2.0))
+        else:
+            part = box_hull(b)
+        rot = spec.get("rot")
+        if rot:
+            try:
+                rot = [float(a) for a in rot]
+                if len(rot) != 3:
+                    return None
+            except (TypeError, ValueError):
+                return None                  # malformed rot = malformed spec
+            if any(rot):
+                centre = ((b[0] + b[3]) / 2.0, (b[1] + b[4]) / 2.0,
+                          (b[2] + b[5]) / 2.0)
+                part = (_rotate_verts(part[0], rot, centre), part[1])
+        return part
     if len(spec) == 6:
         return box_hull(tuple(float(c) for c in spec))
     return None
@@ -928,6 +998,11 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             res["skipped"] = True             # excluded by the model editor
             return res
         m_collision = ov.get("collision") or collision
+        if m_collision == "custom":
+            # "(custom)" GUI option: use hand-authored hulls when present (the
+            # acd_parts branch below fires first regardless of mode), else fall
+            # back to the global collision mode.
+            m_collision = "hulls" if ov.get("hulls") else collision
         m_ramp = ov.get("ramp_axis") or ramp_axis
         m_scale = scale * float(ov.get("scale", 1.0) or 1.0)
         m_surf = ov.get("surfaceprop") or "default"

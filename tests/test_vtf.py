@@ -100,3 +100,45 @@ def test_mixed_shape_hulls_write(tmp_path):
     txt = out.read_text()
     # box 12 + wedge 8 + trap 12 = 32 triangles
     assert txt.count("\nphys\n") == 32
+
+
+def test_cylinder_hull_rings_on_ellipse():
+    from oblivion2vmf.model import cylinder_hull
+    bb = (0.0, 0.0, 1.0, 20.0, 10.0, 9.0)              # ellipse radii 10, 5
+    for sides in (8, 12, 16):
+        verts, faces = cylinder_hull(bb, sides=sides)
+        assert len(verts) == 2 * sides
+        assert {v[2] for v in verts} == {1.0, 9.0}     # only z0 / z1
+        for x, y, _ in verts:                          # on the inscribed ellipse
+            r = ((x - 10.0) / 10.0) ** 2 + ((y - 5.0) / 5.0) ** 2
+            assert abs(r - 1.0) < 1e-9
+        assert {i for f in faces for i in f} == set(range(2 * sides))
+
+
+def test_plane_hull_thickness():
+    from oblivion2vmf.model import plane_hull, _BOX_FACES
+    verts, faces = plane_hull((0, 0, 5, 10, 4, 100), thickness=2.0)
+    assert faces == _BOX_FACES and len(verts) == 8
+    assert {v[2] for v in verts} == {5.0, 7.0}         # z0 .. z0+thickness, not z1
+    assert {(v[0], v[1]) for v in verts} == {(0, 0), (10, 0), (10, 4), (0, 4)}
+
+
+def test_hull_from_spec_cylinder_plane_and_rot():
+    from oblivion2vmf.model import hull_from_spec
+    cyl = hull_from_spec({"type": "cylinder", "bounds": [0, 0, 0, 10, 10, 5], "sides": 8})
+    assert cyl is not None and len(cyl[0]) == 16
+    pl = hull_from_spec({"type": "plane", "bounds": [0, 0, 0, 10, 10, 50]})
+    assert pl is not None and {v[2] for v in pl[0]} == {0.0, 2.0}
+    # rot [0,0,90] about the bounds centre (5,5,5): corner (0,0,0) -> (10,0,0)
+    box = hull_from_spec({"type": "box", "bounds": [0, 0, 0, 10, 10, 10],
+                          "rot": [0, 0, 90]})
+    x, y, z = box[0][0]
+    assert abs(x - 10.0) < 1e-6 and abs(y) < 1e-6 and abs(z) < 1e-6
+    # no rot / zero rot = identical verts (backward compatible)
+    plain = hull_from_spec({"type": "box", "bounds": [0, 0, 0, 10, 10, 10]})
+    zero = hull_from_spec({"type": "box", "bounds": [0, 0, 0, 10, 10, 10],
+                           "rot": [0, 0, 0]})
+    assert plain[0] == zero[0]
+    # junk specs still -> None
+    assert hull_from_spec({"type": "cylinder", "bounds": [1, 2]}) is None
+    assert hull_from_spec([1, 2, 3]) is None
