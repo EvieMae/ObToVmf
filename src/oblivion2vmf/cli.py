@@ -224,7 +224,8 @@ def build_parser():
     mg.add_argument("--skip-compile", action="store_true",
                     help="write .smd/.qc but don't run studiomdl")
     mg.add_argument("--collision",
-                    choices=["auto", "acd", "havok", "full", "bbox", "ramp", "none"],
+                    choices=["auto", "acd", "havok", "custom", "full", "bbox", "ramp",
+                             "none"],
                     default="auto",
                     help="prop collision: 'auto' (solid small props, big buildings "
                          "non-solid so you pass through), 'acd' (walk-in collision via "
@@ -233,8 +234,10 @@ def build_parser():
                          "Havok shell with coplanar faces -> one convex prism per "
                          "wall/floor, no approximation, no extra deps), 'full' (all "
                          "solid, per-triangle), 'bbox' (one box hull per prop), 'ramp' "
-                         "(one wedge rising z0->z1 along --ramp-axis), 'none'. "
-                         "Requires recompile.")
+                         "(one wedge rising z0->z1 along --ramp-axis), 'custom' (use "
+                         "the collision defined per-model in --model-overrides — "
+                         "editor hulls / baked ACD parts; models without an entry "
+                         "fall back to 'auto'), 'none'. Requires recompile.")
     mg.add_argument("--ramp-axis", choices=["+x", "-x", "+y", "-y"], default="+x",
                     help="for --collision ramp: model-local direction the wedge rises "
                          "(default +x). Rotate the prop in-world to aim it.")
@@ -821,6 +824,9 @@ def _build_interior(args, esm):
               "(you can't enter): 'full' convex-hulls the room solid; 'acd' fills "
               "the enclosed volume. Use --collision havok for walk-in rooms."
               % args.collision)
+    elif args.collision == "custom":
+        print("[note] interior: using the overrides' per-model collision; models "
+              "WITHOUT an override entry fall back to havok (walk-in).")
 
     shim = _InteriorShim(refs, ex.base_models)
     placements = model_map = model_scale = None
@@ -936,6 +942,7 @@ def _run_models(args, ex, out_parent, source):
         acd_threshold=args.acd_threshold, acd_max_hulls=args.acd_max_hulls,
         acd_jobs=(args.acd_jobs or None), ramp_axis=args.ramp_axis,
         model_overrides=_load_model_overrides(args.model_overrides),
+        custom_fallback=("havok" if args.interior else "auto"),
         model_lods=args.model_lods,
         trees=args.trees,
         tree_model=args.tree_model, tree_scale=args.tree_scale, tree_map=tree_map,

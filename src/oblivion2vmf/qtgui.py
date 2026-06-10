@@ -505,7 +505,8 @@ class Main(QtWidgets.QMainWindow):
         g.addRow(self._check("skip_compile", "Skip compile (.smd/.qc only)", False))
         g.addRow(self._check("cache", "Reuse model cache", True))
         g.addRow("Collision", self._combo("collision",
-                 ["auto", "acd", "full", "bbox", "ramp", "hulls", "none"], "acd"))
+                 ["auto", "acd", "havok", "custom", "full", "bbox", "ramp", "none"],
+                 "acd"))
         g.addRow("Ramp axis (rise)", self._combo("ramp_axis", ["+x", "-x", "+y", "-y"], "+x"))
         g.addRow("Collision size (HU)", self._edit("collision_size", "400"))
         g.addRow("ACD threshold", self._edit("acd_threshold", "0.08"))

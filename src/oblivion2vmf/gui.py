@@ -177,7 +177,8 @@ class App:
                         variable=self._bv("cache", True)).grid(
             row=1, column=2, sticky="w", padx=4)
         self._combo(f, 2, "Collision", "collision",
-                    ["auto", "acd", "full", "bbox", "ramp", "none"], "acd")
+                    ["auto", "acd", "havok", "custom", "full", "bbox", "ramp", "none"],
+                    "acd")
         self._combo(f, 12, "Ramp axis (rise)", "ramp_axis", ["+x", "-x", "+y", "-y"], "+x")
         self._row(f, 3, "Collision size (HU)", "collision_size", "400")
         self._row(f, 4, "ACD threshold", "acd_threshold", "0.08")

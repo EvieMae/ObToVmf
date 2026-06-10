@@ -1227,7 +1227,7 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                  acd_max_hulls=-1, acd_jobs=None, ramp_axis="+x", model_lods=True,
                  trees=True, tree_model=None, tree_scale=1.0, tree_map=None,
                  jobs=None, use_cache=True, cache_rebuild=False, model_overrides=None,
-                 log=print):
+                 custom_fallback="auto", log=print):
     """Convert every unique mesh referenced by ``placements`` to a .mdl.
 
     base_models : {base_formid: modl_path}
@@ -1300,6 +1300,8 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             ramp_axis if collision == "ramp" else "-",
             "lod" if model_lods else "nolod",
             json.dumps(ov, sort_keys=True) if ov else "-")
+        if collision == "custom":              # fallback only matters in custom mode
+            key += "|cf=%s" % custom_fallback
         return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
     def _build_one(modl):
@@ -1316,10 +1318,13 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             return res
         m_collision = ov.get("collision") or collision
         if m_collision == "custom":
-            # "(custom)" GUI option: use hand-authored hulls when present (the
-            # acd_parts branch below fires first regardless of mode), else fall
-            # back to the global collision mode.
-            m_collision = "hulls" if ov.get("hulls") else collision
+            # 'custom' = use the override-defined collision: hand-authored hulls
+            # when present (the acd_parts branch below fires first regardless of
+            # mode), else fall back to the global mode — or 'auto' when the GLOBAL
+            # mode itself is 'custom' (a model with no override entry).
+            m_collision = ("hulls" if ov.get("hulls")
+                           else (collision if collision != "custom"
+                                 else custom_fallback))
         m_ramp = ov.get("ramp_axis") or ramp_axis
         m_scale = scale * float(ov.get("scale", 1.0) or 1.0)
         m_surf = ov.get("surfaceprop") or "default"
