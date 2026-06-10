@@ -315,7 +315,12 @@ class App:
         threading.Thread(target=self._exec, args=(a,), daemon=True).start()
 
     # ---- model edits (per-model overrides) ----
+<<<<<<< HEAD
     _COLL_CHOICES = ["(global)", "auto", "acd", "full", "bbox", "ramp", "hulls", "none"]
+=======
+    _COLL_CHOICES = ["(global)", "auto", "acd", "full", "bbox", "ramp", "hulls",
+                     "(custom)", "none"]
+>>>>>>> feat/hull-shapes-custom-collision
     _AXIS_CHOICES = ["+x", "-x", "+y", "-y"]
 
     def _work_dir(self):
@@ -443,7 +448,12 @@ class App:
                 row=i, column=0, padx=2, sticky="w")
             ttk.Label(self.me_rows, text=(str(n) if n else "·"), width=4,
                       anchor="e").grid(row=i, column=1, padx=2)
+<<<<<<< HEAD
             coll = tk.StringVar(value=ov.get("collision") or "(global)")
+=======
+            saved_coll = ov.get("collision") or "(global)"
+            coll = tk.StringVar(value="(custom)" if saved_coll == "custom" else saved_coll)
+>>>>>>> feat/hull-shapes-custom-collision
             ttk.Combobox(self.me_rows, textvariable=coll, values=self._COLL_CHOICES,
                          width=9, state="readonly").grid(row=i, column=2, padx=2)
             ramp = tk.StringVar(value=ov.get("ramp_axis") or "+x")
@@ -502,12 +512,25 @@ class App:
         out = {}
         for modl, r in self.model_rows.items():
             d = {}
+<<<<<<< HEAD
             if r["collision"].get() not in ("(global)", ""):
                 d["collision"] = r["collision"].get()
                 if d["collision"] == "ramp":
                     d["ramp_axis"] = r["ramp"].get()
                 if d["collision"] == "hulls" and r.get("hulls"):
                     d["hulls"] = [[round(float(c), 2) for c in b] for b in r["hulls"]]
+=======
+            coll = r["collision"].get()
+            if coll not in ("(global)", ""):
+                d["collision"] = "custom" if coll == "(custom)" else coll
+                if d["collision"] == "ramp":
+                    d["ramp_axis"] = r["ramp"].get()
+                if coll in ("hulls", "(custom)") and r.get("hulls"):
+                    # boxes are compact 6-float lists; shaped hulls are dicts
+                    d["hulls"] = [h if isinstance(h, dict)
+                                  else [round(float(c), 2) for c in h]
+                                  for h in r["hulls"]]
+>>>>>>> feat/hull-shapes-custom-collision
             sc = r["scale"].get().strip()
             if sc:
                 try:

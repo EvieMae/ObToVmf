@@ -430,6 +430,8 @@ class Main(QtWidgets.QMainWindow):
         for lab, fn in [("Add box", lambda: self._add_hull("box")),
                         ("Add wedge", lambda: self._add_hull("wedge")),
                         ("Add trapezium", lambda: self._add_hull("trap")),
+                        ("Add cylinder", lambda: self._add_hull("cylinder")),
+                        ("Add plane", lambda: self._add_hull("plane")),
                         ("Remove", self._remove_box),
                         ("Fit to model", self._fit_box),
                         ("Save hulls → row", self._commit_hulls)]:
@@ -449,6 +451,11 @@ class Main(QtWidgets.QMainWindow):
         self.trap_top.setSingleStep(0.05)
         self.trap_top.setValue(0.5)
         sb.addWidget(self.trap_top)
+        sb.addWidget(QtWidgets.QLabel("Cylinder sides"))
+        self.cyl_sides = QtWidgets.QComboBox()
+        self.cyl_sides.addItems(["8", "12", "16"])
+        self.cyl_sides.setCurrentText("12")
+        sb.addWidget(self.cyl_sides)
         sb.addStretch(1)
         rv.addLayout(sb)
 
@@ -702,8 +709,10 @@ class Main(QtWidgets.QMainWindow):
             it.setData(Qt.UserRole, modl)
             self.table.setItem(i, 0, it)
             coll = QtWidgets.QComboBox()
-            coll.addItems(["(global)", "auto", "acd", "full", "bbox", "ramp", "hulls", "none"])
-            coll.setCurrentText(ov.get("collision") or "(global)")
+            coll.addItems(["(global)", "auto", "acd", "full", "bbox", "ramp", "hulls",
+                           "(custom)", "none"])
+            saved_coll = ov.get("collision") or "(global)"
+            coll.setCurrentText("(custom)" if saved_coll == "custom" else saved_coll)
             self.table.setCellWidget(i, 1, coll)
             ramp = QtWidgets.QComboBox()
             ramp.addItems(["+x", "-x", "+y", "-y"])
@@ -783,7 +792,7 @@ class Main(QtWidgets.QMainWindow):
             s = self._hull_spec(h)
             if len(s["bounds"]) == 6:
                 self._spawn_box(self._to_vtk_bounds(s["bounds"]), s["type"],
-                                s["axis"], s["top_scale"])
+                                s["axis"], s["top_scale"], sides=s["sides"])
         if self.model_rows[modl].get("acd_parts"):
             self._show_acd(self.model_rows[modl]["acd_parts"])
         self._grid()
@@ -938,7 +947,8 @@ class Main(QtWidgets.QMainWindow):
          "yz": self.plotter.view_yz, "iso": self.plotter.view_isometric}[which]()
         self.plotter.render()
 
-    _SHAPE_COLORS = {"box": "#46c0ff", "wedge": "#ffd54f", "trap": "#80cbc4"}
+    _SHAPE_COLORS = {"box": "#46c0ff", "wedge": "#ffd54f", "trap": "#80cbc4",
+                     "cylinder": "#ce93d8", "plane": "#a5d6a7"}
 
     @staticmethod
     def _hull_spec(entry):
@@ -947,13 +957,16 @@ class Main(QtWidgets.QMainWindow):
             return {"type": (entry.get("type") or "box").lower(),
                     "bounds": [float(c) for c in entry.get("bounds", [])[:6]],
                     "axis": entry.get("axis", "+x"),
-                    "top_scale": float(entry.get("top_scale", 0.5))}
+                    "top_scale": float(entry.get("top_scale", 0.5)),
+                    "sides": int(entry.get("sides", 12)),
+                    "rot": [float(a) for a in entry.get("rot", (0, 0, 0))]}
         return {"type": "box", "bounds": [float(c) for c in entry[:6]],
-                "axis": "+x", "top_scale": 0.5}
+                "axis": "+x", "top_scale": 0.5, "sides": 12, "rot": [0.0, 0.0, 0.0]}
 
-    def _spawn_box(self, vtk_bounds, shape="box", axis="+x", top_scale=0.5):
+    def _spawn_box(self, vtk_bounds, shape="box", axis="+x", top_scale=0.5, sides=12):
         entry = {"widget": None, "bounds": vtk_bounds, "type": shape, "axis": axis,
-                 "top_scale": top_scale, "name": "hullprev_%d" % len(self.boxes)}
+                 "top_scale": top_scale, "sides": sides,
+                 "name": "hullprev_%d" % len(self.boxes)}
 
         def cb(box, widget):
             entry["bounds"] = box.bounds
@@ -972,8 +985,13 @@ class Main(QtWidgets.QMainWindow):
             return
         part = hull_from_spec({"type": entry["type"],
                                "bounds": self._from_vtk_bounds(entry["bounds"]),
-                               "axis": entry["axis"], "top_scale": entry["top_scale"]})
-        if part is None:
+                               "axis": entry["axis"], "top_scale": entry["top_scale"],
+                               "sides": entry.get("sides", 12)})
+        if part is None:                       # shape not buildable yet — keep the gizmo
+            try:
+                self.plotter.remove_actor(entry["name"])
+            except Exception:
+                pass
             return
         verts, faces = part
         mesh = pv.PolyData(np.array(verts, dtype=float),
@@ -990,7 +1008,8 @@ class Main(QtWidgets.QMainWindow):
             return
         self._spawn_box(self._default_box_bounds(), shape,
                         axis=self.wedge_axis.currentText(),
-                        top_scale=float(self.trap_top.value()))
+                        top_scale=float(self.trap_top.value()),
+                        sides=int(self.cyl_sides.currentText()))
         self.plotter.render()
 
     def _remove_box(self):
@@ -1023,10 +1042,11 @@ class Main(QtWidgets.QMainWindow):
 
     def _respawn_boxes(self):
         """Rebuild all widgets + previews from current state (after add/remove)."""
-        specs = [(e["bounds"], e["type"], e["axis"], e["top_scale"]) for e in self.boxes]
+        specs = [(e["bounds"], e["type"], e["axis"], e["top_scale"], e.get("sides", 12))
+                 for e in self.boxes]
         self._clear_boxes()
-        for vb, t, ax, ts in specs:
-            self._spawn_box(vb, t, ax, ts)
+        for vb, t, ax, ts, sd in specs:
+            self._spawn_box(vb, t, ax, ts, sides=sd)
         self.plotter.render()
 
     def _commit_hulls(self):
@@ -1039,6 +1059,11 @@ class Main(QtWidgets.QMainWindow):
                 hulls.append(b)                    # legacy compact form
             elif e["type"] == "wedge":
                 hulls.append({"type": "wedge", "bounds": b, "axis": e["axis"]})
+            elif e["type"] == "cylinder":
+                hulls.append({"type": "cylinder", "bounds": b,
+                              "sides": int(e.get("sides", 12))})
+            elif e["type"] == "plane":
+                hulls.append({"type": "plane", "bounds": b})
             else:
                 hulls.append({"type": "trap", "bounds": b,
                               "top_scale": round(float(e["top_scale"]), 3)})
@@ -1054,16 +1079,16 @@ class Main(QtWidgets.QMainWindow):
             d = {}
             coll = r["collision"].currentText()
             if coll not in ("(global)", ""):
-                d["collision"] = coll
+                d["collision"] = "custom" if coll == "(custom)" else coll
                 if coll == "ramp":
                     d["ramp_axis"] = r["ramp"].currentText()
-                if coll == "hulls" and r.get("hulls"):
+                if coll in ("hulls", "(custom)") and r.get("hulls"):
                     # boxes are compact 6-float lists; wedges/trapeziums are dicts
                     # (already rounded at commit time)
                     d["hulls"] = [h if isinstance(h, dict)
                                   else [round(float(c), 2) for c in h]
                                   for h in r["hulls"]]
-                if coll == "acd" and r.get("acd_parts"):
+                if coll in ("acd", "(custom)") and r.get("acd_parts"):
                     # store the exact previewed convex parts so the build bakes
                     # them verbatim instead of recomputing CoACD
                     d["acd_parts"] = [[[[round(float(c), 3) for c in v] for v in pv_],
