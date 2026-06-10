@@ -641,6 +641,7 @@ class Main(QtWidgets.QMainWindow):
                         ("Remove", self._remove_box),
                         ("Fit to model", self._fit_box),
                         ("Save hulls → row", self._commit_hulls),
+                        ("Havok → exact pieces", self._havok_exact_pieces),
                         ("Import NIF collision", self._import_nif_collision),
                         ("Edit collision in Blender ⧉", self._edit_in_blender),
                         ("Import from Blender", self._import_from_blender)]:
@@ -932,8 +933,8 @@ class Main(QtWidgets.QMainWindow):
             it.setData(Qt.UserRole, modl)
             self.table.setItem(i, 0, it)
             coll = QtWidgets.QComboBox()
-            coll.addItems(["(global)", "auto", "acd", "full", "bbox", "ramp", "hulls",
-                           "(custom)", "none"])
+            coll.addItems(["(global)", "auto", "acd", "havok", "full", "bbox", "ramp",
+                           "hulls", "(custom)", "none"])
             saved_coll = ov.get("collision") or "(global)"
             coll.setCurrentText("(custom)" if saved_coll == "custom" else saved_coll)
             coll.currentTextChanged.connect(self._apply_table_filter)
@@ -2104,6 +2105,40 @@ class Main(QtWidgets.QMainWindow):
         if hulls:
             self.model_rows[self.cur_model]["collision"].setCurrentText("hulls")
         self._append("%s: %d hull(s) set (now Save overrides)." % (self.cur_model, len(hulls)))
+
+    def _havok_exact_pieces(self):
+        """Exact collision from the NIF's Havok shell: coplanar faces -> convex
+        prisms (one per wall/floor). Precise, no CoACD, no fill — ideal for
+        awkward interiors. Stored as baked parts so the build uses them verbatim."""
+        modl = self.cur_model or self._selected_model()
+        if not modl:
+            self._append("Select a model row first.")
+            return
+        if self._nif_source() is None:
+            self._append("Add the Meshes BSA (or a loose Data dir) on the Input tab "
+                         "first — the Havok collision is read from there.")
+            return
+        subs = self._havok_collision_subs(modl)
+        if not subs:
+            self._append("%s has no Havok collision in its .nif." % os.path.basename(modl))
+            return
+        from .model import coplanar_convex_pieces
+        parts = coplanar_convex_pieces(subs)
+        if not parts:
+            self._append("Could not build convex pieces (numpy required).")
+            return
+        row = self.model_rows.get(modl)
+        if row is None:
+            self._append("Model %s is not in the table; re-scan." % modl)
+            return
+        row["acd_parts"] = [[[list(map(float, v)) for v in pv_],
+                             [list(map(int, f)) for f in pf]] for pv_, pf in parts]
+        row["collision"].setCurrentText("acd")     # acd_parts path bakes them verbatim
+        self._append("Havok exact collision for %s: %d convex piece(s) from coplanar "
+                     "faces. Save overrides to keep them." % (os.path.basename(modl), len(parts)))
+        if modl == self.cur_model and self.plotter is not None:
+            self.cur_model = None
+            self._load_model_3d(modl)
 
     def _import_nif_collision(self):
         """Pull the model's authored Havok collision shell straight from the .nif

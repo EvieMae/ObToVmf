@@ -224,14 +224,17 @@ def build_parser():
     mg.add_argument("--skip-compile", action="store_true",
                     help="write .smd/.qc but don't run studiomdl")
     mg.add_argument("--collision",
-                    choices=["auto", "acd", "full", "bbox", "ramp", "none"], default="auto",
+                    choices=["auto", "acd", "havok", "full", "bbox", "ramp", "none"],
+                    default="auto",
                     help="prop collision: 'auto' (solid small props, big buildings "
-                         "non-solid so you pass through), 'acd' (ACCURATE walk-in "
-                         "collision for buildings via convex decomposition, needs "
-                         "`pip install coacd`), 'full' (all solid, per-triangle), "
-                         "'bbox' (one box hull around each prop -- cheap blocker), "
-                         "'ramp' (one wedge hull rising z0->z1 along --ramp-axis, so "
-                         "you walk UP the slope), 'none'. Requires recompile.")
+                         "non-solid so you pass through), 'acd' (walk-in collision via "
+                         "CoACD convex decomposition of the Havok shell, needs "
+                         "`pip install coacd`), 'havok' (EXACT collision: Bethesda's "
+                         "Havok shell with coplanar faces -> one convex prism per "
+                         "wall/floor, no approximation, no extra deps), 'full' (all "
+                         "solid, per-triangle), 'bbox' (one box hull per prop), 'ramp' "
+                         "(one wedge rising z0->z1 along --ramp-axis), 'none'. "
+                         "Requires recompile.")
     mg.add_argument("--ramp-axis", choices=["+x", "-x", "+y", "-y"], default="+x",
                     help="for --collision ramp: model-local direction the wedge rises "
                          "(default +x). Rotate the prop in-world to aim it.")

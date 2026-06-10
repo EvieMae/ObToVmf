@@ -161,3 +161,31 @@ def test_mesh_hull_spec_roundtrip(tmp_path):
     out = tmp_path / "m.smd"
     write_collision_smd([part], str(out), scale=1.0)
     assert out.read_text().count("\nphys\n") == 12
+
+
+def test_coplanar_convex_pieces_cube_is_six(tmp_path):
+    # a cube's Havok-style trimesh (12 tris) -> 6 exact convex wall pieces
+    from oblivion2vmf.model import box_hull, coplanar_convex_pieces, write_collision_smd
+    verts, faces = box_hull((0.0, 0.0, 0.0, 100.0, 100.0, 100.0))
+    subs = [{"verts": [list(v) for v in verts], "tris": [list(f) for f in faces]}]
+    parts = coplanar_convex_pieces(subs, thickness=4.0)
+    assert parts is not None
+    assert len(parts) == 6                          # one prism per cube face
+    for pv_, pf in parts:
+        assert len(pv_) == 8 and len(pf) >= 4        # quad face -> 8-vert prism
+    out = tmp_path / "phys.smd"
+    write_collision_smd(parts, str(out), scale=1.0)
+    assert out.read_text().count("\nphys\n") >= 6 * 4
+
+
+def test_coplanar_pieces_concave_patch_falls_back(tmp_path):
+    # an L-shaped coplanar patch (non-convex outline) -> per-triangle prisms, not
+    # one over-filling hull
+    from oblivion2vmf.model import coplanar_convex_pieces
+    # L in the z=0 plane from 3 squares' worth of triangles (6 tris)
+    v = [[0, 0, 0], [2, 0, 0], [2, 1, 0], [0, 1, 0],   # bottom bar
+         [0, 1, 0], [1, 1, 0], [1, 2, 0], [0, 2, 0]]   # upright bar
+    tris = [[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]]
+    parts = coplanar_convex_pieces([{"verts": v, "tris": tris}], thickness=2.0)
+    # the L outline over-fills its convex hull, so it must NOT collapse to 1 piece
+    assert len(parts) >= 2

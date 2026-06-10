@@ -187,6 +187,151 @@ def write_collision_smd(parts, path, scale=1.0, material="phys"):
         f.write("\n".join(out) + "\n")
 
 
+# --- exact (Havok-style) collision: coplanar faces -> convex prisms ----------
+
+def _convex_hull_2d(pts):
+    """Andrew's monotone-chain convex hull of 2D points -> ordered (x,y) list."""
+    pts = sorted(set((round(x, 4), round(y, 4)) for x, y in pts))
+    if len(pts) < 3:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _poly_area(poly):
+    a = 0.0
+    n = len(poly)
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        a += x0 * y1 - x1 * y0
+    return abs(a) * 0.5
+
+
+def _prism(poly3d, normal, thickness):
+    """Extrude a planar polygon +/- thickness/2 along its normal into a convex
+    prism part (verts, faces). studiomdl re-hulls it, so the faces just need to
+    cover every vertex."""
+    half = [normal[i] * (thickness / 2.0) for i in range(3)]
+    m = len(poly3d)
+    verts = [[p[i] + half[i] for i in range(3)] for p in poly3d]
+    verts += [[p[i] - half[i] for i in range(3)] for p in poly3d]
+    faces = []
+    for i in range(1, m - 1):
+        faces.append((0, i, i + 1))                 # top cap fan
+        faces.append((m, m + i + 1, m + i))         # bottom cap fan
+    for i in range(m):                              # sides
+        j = (i + 1) % m
+        faces.append((i, m + i, m + j))
+        faces.append((i, m + j, j))
+    return (verts, faces)
+
+
+def coplanar_convex_pieces(subs, thickness=4.0, normal_tol=0.999, dist_tol=0.5,
+                           area_slack=0.08, max_pieces=4000):
+    """Convert a Havok collision trimesh into ACCURATE convex pieces by grouping
+    coplanar, edge-connected triangles into patches and extruding each patch's
+    convex outline into a thin solid prism. Flat walls/floors become ONE exact
+    piece each (no approximation); a non-convex patch (its outline over-fills its
+    own hull) falls back to per-triangle prisms. Returns [(verts, faces)] in the
+    same units as ``subs``.
+
+    This is the precise alternative to CoACD: it reproduces Bethesda's authored
+    Havok collision surface rather than approximating its volume."""
+    if _np is None:
+        return None
+    verts, tris = [], []
+    for s in subs:
+        base = len(verts)
+        verts.extend(tuple(float(c) for c in v) for v in s["verts"])
+        tris.extend((t[0] + base, t[1] + base, t[2] + base) for t in s["tris"])
+    if not tris:
+        return []
+    V = _np.asarray(verts, dtype=float)
+
+    # canonical position index so duplicated verts still share edges
+    canon, pos = [], {}
+    for i in range(len(V)):
+        k = (round(V[i, 0], 3), round(V[i, 1], 3), round(V[i, 2], 3))
+        canon.append(pos.setdefault(k, i))
+
+    planes = []
+    for t in tris:
+        a, b, c = V[t[0]], V[t[1]], V[t[2]]
+        n = _np.cross(b - a, c - a)
+        L = float(_np.linalg.norm(n))
+        planes.append((n / L, float((n / L) @ a)) if L > 1e-9 else None)
+
+    edges = {}
+    for ti, t in enumerate(tris):
+        if planes[ti] is None:
+            continue
+        cv = [canon[t[0]], canon[t[1]], canon[t[2]]]
+        for e in (cv[0], cv[1]), (cv[1], cv[2]), (cv[2], cv[0]):
+            edges.setdefault(frozenset(e), []).append(ti)
+
+    parent = list(range(len(tris)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for ts in edges.values():                       # union coplanar neighbours
+        for j in range(1, len(ts)):
+            t0, t1 = ts[0], ts[j]
+            if planes[t0] is None or planes[t1] is None:
+                continue
+            (n0, d0), (n1, d1) = planes[t0], planes[t1]
+            dot = float(n0 @ n1)
+            same = (dot > normal_tol and abs(d0 - d1) < dist_tol) or \
+                   (dot < -normal_tol and abs(d0 + d1) < dist_tol)
+            if same:
+                parent[find(t0)] = find(t1)
+
+    groups = {}
+    for ti in range(len(tris)):
+        if planes[ti] is not None:
+            groups.setdefault(find(ti), []).append(ti)
+
+    parts = []
+    for tlist in groups.values():
+        n, d = planes[tlist[0]]
+        ref = _np.array([1.0, 0, 0]) if abs(n[0]) < 0.9 else _np.array([0, 1.0, 0])
+        u = _np.cross(n, ref)
+        u /= _np.linalg.norm(u)
+        w = _np.cross(n, u)
+        vidx = sorted({i for ti in tlist for i in tris[ti]})
+        pts3 = V[vidx]
+        proj = [(float(p @ u), float(p @ w)) for p in pts3]
+        hull = _convex_hull_2d(proj)
+        patch_area = sum(0.5 * float(_np.linalg.norm(
+            _np.cross(V[t[1]] - V[t[0]], V[t[2]] - V[t[0]]))) for t in (tris[ti] for ti in tlist))
+        if len(hull) >= 3 and _poly_area(hull) <= patch_area * (1.0 + area_slack) + 1e-6:
+            origin = n * d
+            poly3d = [(origin + x * u + y * w) for x, y in hull]
+            parts.append(_prism(poly3d, n, thickness))
+        else:                                       # concave patch -> per triangle
+            for ti in tlist:
+                tri3 = [V[i] for i in tris[ti]]
+                parts.append(_prism(tri3, n, thickness))
+        if len(parts) > max_pieces:
+            break
+    return parts
+
+
 def _aabb(subs):
     """Axis-aligned bounds of all submesh verts as (x0,y0,z0,x1,y1,z1) in MODEL
     units (pre-scale), or None when empty."""
@@ -1123,6 +1268,13 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                     coll_smd, maxc = phys, max(64, len(parts) + 8)
             elif m_collision == "none":
                 pass
+            elif m_collision == "havok":
+                # Exact collision from Bethesda's Havok shell: coplanar faces ->
+                # convex prisms (one per wall/floor). No CoACD needed; precise.
+                parts = coplanar_convex_pieces(coll_subs) or []
+                if parts:
+                    write_collision_smd(parts, phys, scale=m_scale)
+                    coll_smd, maxc = phys, max(64, len(parts) + 8)
             elif m_collision == "hulls":
                 # Multiple hand-authored hulls (GUI 3D editor): boxes, wedges, or
                 # trapezoidal prisms. Coords are in FINAL (SMD/Hammer) units ->
