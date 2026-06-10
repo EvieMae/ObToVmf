@@ -240,7 +240,7 @@ def _prism(poly3d, normal, thickness):
 
 
 def coplanar_convex_pieces(subs, thickness=4.0, normal_tol=0.999, dist_tol=0.5,
-                           area_slack=0.08, max_pieces=4000):
+                           area_slack=0.08, max_pieces=4000, jobs=None):
     """Convert a Havok collision trimesh into ACCURATE convex pieces by grouping
     coplanar, edge-connected triangles into patches and extruding each patch's
     convex outline into a thin solid prism. Flat walls/floors become ONE exact
@@ -248,8 +248,10 @@ def coplanar_convex_pieces(subs, thickness=4.0, normal_tol=0.999, dist_tol=0.5,
     own hull) falls back to per-triangle prisms. Returns [(verts, faces)] in the
     same units as ``subs``.
 
-    This is the precise alternative to CoACD: it reproduces Bethesda's authored
-    Havok collision surface rather than approximating its volume."""
+    Plane math is vectorised with numpy, and the independent per-patch work runs
+    across a thread pool (``jobs`` workers, default min(8, cores)). This is the
+    precise alternative to CoACD: it reproduces Bethesda's authored Havok collision
+    surface rather than approximating its volume."""
     if _np is None:
         return None
     verts, tris = [], []
@@ -260,25 +262,29 @@ def coplanar_convex_pieces(subs, thickness=4.0, normal_tol=0.999, dist_tol=0.5,
     if not tris:
         return []
     V = _np.asarray(verts, dtype=float)
+    T = _np.asarray(tris, dtype=_np.int64)
+
+    # vectorised per-triangle plane (unit normal + offset d = n·a) and area
+    a, b, c = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]
+    nrm = _np.cross(b - a, c - a)
+    L = _np.linalg.norm(nrm, axis=1)
+    valid = L > 1e-9
+    safeL = _np.where(valid, L, 1.0)
+    N = nrm / safeL[:, None]                         # unit normals
+    D = _np.einsum("ij,ij->i", N, a)                # plane offsets
+    AREA = 0.5 * L                                   # triangle areas
 
     # canonical position index so duplicated verts still share edges
-    canon, pos = [], {}
+    canon, pos = [0] * len(V), {}
     for i in range(len(V)):
-        k = (round(V[i, 0], 3), round(V[i, 1], 3), round(V[i, 2], 3))
-        canon.append(pos.setdefault(k, i))
-
-    planes = []
-    for t in tris:
-        a, b, c = V[t[0]], V[t[1]], V[t[2]]
-        n = _np.cross(b - a, c - a)
-        L = float(_np.linalg.norm(n))
-        planes.append((n / L, float((n / L) @ a)) if L > 1e-9 else None)
+        k = (round(float(V[i, 0]), 3), round(float(V[i, 1]), 3), round(float(V[i, 2]), 3))
+        canon[i] = pos.setdefault(k, i)
 
     edges = {}
-    for ti, t in enumerate(tris):
-        if planes[ti] is None:
+    for ti in range(len(tris)):
+        if not valid[ti]:
             continue
-        cv = [canon[t[0]], canon[t[1]], canon[t[2]]]
+        cv = (canon[T[ti, 0]], canon[T[ti, 1]], canon[T[ti, 2]])
         for e in (cv[0], cv[1]), (cv[1], cv[2]), (cv[2], cv[0]):
             edges.setdefault(frozenset(e), []).append(ti)
 
@@ -292,44 +298,51 @@ def coplanar_convex_pieces(subs, thickness=4.0, normal_tol=0.999, dist_tol=0.5,
     for ts in edges.values():                       # union coplanar neighbours
         for j in range(1, len(ts)):
             t0, t1 = ts[0], ts[j]
-            if planes[t0] is None or planes[t1] is None:
-                continue
-            (n0, d0), (n1, d1) = planes[t0], planes[t1]
-            dot = float(n0 @ n1)
-            same = (dot > normal_tol and abs(d0 - d1) < dist_tol) or \
-                   (dot < -normal_tol and abs(d0 + d1) < dist_tol)
+            dot = float(N[t0] @ N[t1])
+            same = (dot > normal_tol and abs(D[t0] - D[t1]) < dist_tol) or \
+                   (dot < -normal_tol and abs(D[t0] + D[t1]) < dist_tol)
             if same:
                 parent[find(t0)] = find(t1)
 
     groups = {}
     for ti in range(len(tris)):
-        if planes[ti] is not None:
+        if valid[ti]:
             groups.setdefault(find(ti), []).append(ti)
+    group_lists = list(groups.values())
 
-    parts = []
-    for tlist in groups.values():
-        n, d = planes[tlist[0]]
+    def process(tlist):
+        """Build the convex piece(s) for one coplanar patch (read-only over the
+        shared arrays, so it's thread-safe)."""
+        n, d = N[tlist[0]], float(D[tlist[0]])
         ref = _np.array([1.0, 0, 0]) if abs(n[0]) < 0.9 else _np.array([0, 1.0, 0])
         u = _np.cross(n, ref)
         u /= _np.linalg.norm(u)
         w = _np.cross(n, u)
-        vidx = sorted({i for ti in tlist for i in tris[ti]})
+        vidx = sorted({int(i) for ti in tlist for i in T[ti]})
         pts3 = V[vidx]
-        proj = [(float(p @ u), float(p @ w)) for p in pts3]
+        proj = list(zip((pts3 @ u).tolist(), (pts3 @ w).tolist()))
         hull = _convex_hull_2d(proj)
-        patch_area = sum(0.5 * float(_np.linalg.norm(
-            _np.cross(V[t[1]] - V[t[0]], V[t[2]] - V[t[0]]))) for t in (tris[ti] for ti in tlist))
+        patch_area = float(AREA[tlist].sum())
         if len(hull) >= 3 and _poly_area(hull) <= patch_area * (1.0 + area_slack) + 1e-6:
             origin = n * d
             poly3d = [(origin + x * u + y * w) for x, y in hull]
-            parts.append(_prism(poly3d, n, thickness))
-        else:                                       # concave patch -> per triangle
-            for ti in tlist:
-                tri3 = [V[i] for i in tris[ti]]
-                parts.append(_prism(tri3, n, thickness))
-        if len(parts) > max_pieces:
-            break
-    return parts
+            return [_prism(poly3d, n, thickness)]
+        return [_prism([V[i] for i in T[ti]], n, thickness) for ti in tlist]
+
+    nworkers = max(1, jobs or min(8, (os.cpu_count() or 4)))
+    parts = []
+    if nworkers == 1 or len(group_lists) <= 1:
+        for tlist in group_lists:
+            parts.extend(process(tlist))
+            if len(parts) > max_pieces:
+                break
+    else:
+        with ThreadPoolExecutor(max_workers=nworkers) as ex:
+            for res in ex.map(process, group_lists):
+                parts.extend(res)
+                if len(parts) > max_pieces:
+                    break
+    return parts[:max_pieces] if len(parts) > max_pieces else parts
 
 
 def _aabb(subs):
@@ -1271,7 +1284,8 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             elif m_collision == "havok":
                 # Exact collision from Bethesda's Havok shell: coplanar faces ->
                 # convex prisms (one per wall/floor). No CoACD needed; precise.
-                parts = coplanar_convex_pieces(coll_subs) or []
+                # 1 worker here — build_models already parallelises across meshes.
+                parts = coplanar_convex_pieces(coll_subs, jobs=1) or []
                 if parts:
                     write_collision_smd(parts, phys, scale=m_scale)
                     coll_smd, maxc = phys, max(64, len(parts) + 8)

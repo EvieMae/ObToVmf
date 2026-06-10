@@ -718,6 +718,7 @@ class Main(QtWidgets.QMainWindow):
                         ("Fit to model", self._fit_box),
                         ("Save hulls → row", self._commit_hulls),
                         ("Havok → exact pieces", self._havok_exact_pieces),
+                        ("Havok → all (parallel)", self._havok_all_parallel),
                         ("Import NIF collision", self._import_nif_collision),
                         ("Edit collision in Blender ⧉", self._edit_in_blender),
                         ("Import from Blender", self._import_from_blender)]:
@@ -2191,9 +2192,14 @@ class Main(QtWidgets.QMainWindow):
             scl = float(self.getters["scale"]())
         except (ValueError, KeyError):
             scl = 1.0
+        try:
+            jobs = int(self.getters["jobs"]()) or None
+        except (ValueError, KeyError):
+            jobs = None
         bsas = list(self.bsa_list)
-        self._append("Havok exact collision for %s: reading NIF + decomposing…"
-                     % os.path.basename(modl))
+        self._append("Havok exact collision for %s: reading NIF + decomposing "
+                     "(%s worker threads)…"
+                     % (os.path.basename(modl), jobs or "auto"))
 
         def work():
             try:
@@ -2208,7 +2214,7 @@ class Main(QtWidgets.QMainWindow):
                     return
                 subs = [{"verts": [[v[0] * scl, v[1] * scl, v[2] * scl] for v in s["verts"]],
                          "tris": [list(t) for t in s["tris"]]} for s in coll]
-                self.havok_ready.emit(modl, coplanar_convex_pieces(subs))
+                self.havok_ready.emit(modl, coplanar_convex_pieces(subs, jobs=jobs))
             except Exception as e:
                 self.havok_ready.emit(modl, ("err", repr(e)))
         import threading
