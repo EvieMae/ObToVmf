@@ -126,6 +126,15 @@ def _matrix_to_euler_deg(m):
     return [float(np.degrees(a)) for a in (rx, ry, rz)]
 
 
+def _maybe_snap_rotation(r):
+    """Holding Shift while dragging a gizmo ring snaps the baked rotation to 45°
+    increments (checked at release time — VTK doesn't expose live modifiers)."""
+    if not (QtWidgets.QApplication.keyboardModifiers() & Qt.ShiftModifier):
+        return r
+    eul = _matrix_to_euler_deg(r)
+    return _euler_deg_to_matrix([round(a / 45.0) * 45.0 for a in eul])
+
+
 def _rotated_part(part, rot, center):
     """Rotate a (verts, faces) hull about `center` — local fallback for builds of
     hull_from_spec that don't understand a "rot" key yet."""
@@ -165,6 +174,8 @@ class Main(QtWidgets.QMainWindow):
         self._gizmo = None          # the single affine-transform widget
         self._face_sel = None       # {"idx": [vert indices], "normal": np3} in face mode
         self._face_mode = False
+        self._tool_mode = "gizmo"   # "camera" | "gizmo" | "faces" (floating dock)
+        self._tool_dock = None
         self._xf_loading = False    # guard: transform panel being populated
         self.acd_actors = []       # named actors of the current ACD preview
         self.cur_model = None      # nif currently loaded in the 3D view
@@ -516,6 +527,7 @@ class Main(QtWidgets.QMainWindow):
                 rv.addWidget(self.plotter.interactor, 1)
                 self._style_viewport()
                 self._apply_camera_style()
+                self._build_tool_dock()
             except Exception as e:                       # missing/old GL drivers, etc.
                 rv.addWidget(QtWidgets.QLabel(
                     "3D viewport failed to initialise (OpenGL?):\n%r\n\n"
@@ -523,19 +535,6 @@ class Main(QtWidgets.QMainWindow):
                     "overrides JSON." % (e,)))
         else:
             rv.addWidget(QtWidgets.QLabel("pyvista not available:\n%r" % (_IMPORT_ERR,)))
-        # axis-snap camera views
-        vb = QtWidgets.QHBoxLayout()
-        vb.addWidget(QtWidgets.QLabel("View"))
-        for lab, fn in [("Top", lambda: self._snap_view("xy")),
-                        ("Front", lambda: self._snap_view("xz")),
-                        ("Side", lambda: self._snap_view("yz")),
-                        ("Iso", lambda: self._snap_view("iso"))]:
-            b = QtWidgets.QPushButton(lab)
-            b.setMaximumWidth(52)
-            b.clicked.connect(fn)
-            vb.addWidget(b)
-        vb.addStretch(1)
-        rv.addLayout(vb)
 
         hb = QtWidgets.QHBoxLayout()
         for lab, fn in [("Add box", lambda: self._add_hull("box")),
@@ -1068,6 +1067,93 @@ class Main(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    # ---- floating tool dock (overlays the top of the viewport) ----
+    def _build_tool_dock(self):
+        """A Blender-style floating toolbar over the viewport: tool modes (camera /
+        move-rotate gizmo / faces) + axis view snaps, so every movement option lives
+        in one place without costing viewport height."""
+        host = self.plotter.interactor
+        dock = QtWidgets.QFrame(host)
+        dock.setObjectName("toolDock")
+        dock.setStyleSheet(
+            "#toolDock { background: rgba(22,28,36,210); border: 1px solid #3a4654;"
+            " border-radius: 6px; }"
+            "QToolButton { background: transparent; color: #d6dae0; padding: 4px 8px;"
+            " border: 1px solid transparent; border-radius: 4px; font-size: 13px; }"
+            "QToolButton:hover { background: #2d3640; }"
+            "QToolButton:checked { background: #2f5d8a; border-color: #46c0ff; }")
+        h = QtWidgets.QHBoxLayout(dock)
+        h.setContentsMargins(6, 4, 6, 4)
+        h.setSpacing(2)
+        self._mode_btns = {}
+
+        def mode_btn(text, tip, mode):
+            b = QtWidgets.QToolButton(dock)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.setAutoExclusive(True)
+            b.clicked.connect(lambda: self._set_tool_mode(mode))
+            h.addWidget(b)
+            self._mode_btns[mode] = b
+            return b
+        mode_btn("\U0001f590", "Camera only — orbit/pan/zoom, no gizmo", "camera")
+        mode_btn("✥", "Move / Rotate — gizmo on the selected hull "
+                           "(hold Shift on rings to snap 45°)", "gizmo").setChecked(True)
+        mode_btn("▦", "Face mode — click a face, gizmo moves/tilts it", "faces")
+
+        sepa = QtWidgets.QFrame(dock)
+        sepa.setFrameShape(QtWidgets.QFrame.VLine)
+        sepa.setStyleSheet("color:#3a4654;")
+        h.addWidget(sepa)
+        for lab, which in (("Top", "xy"), ("Front", "xz"), ("Side", "yz"), ("Iso", "iso")):
+            b = QtWidgets.QToolButton(dock)
+            b.setText(lab)
+            b.clicked.connect(lambda _=False, w=which: self._snap_view(w))
+            h.addWidget(b)
+        dock.adjustSize()
+        dock.show()
+        dock.raise_()
+        self._tool_dock = dock
+        host.installEventFilter(self)
+        self._place_tool_dock()
+
+    def _place_tool_dock(self):
+        if self._tool_dock is None or self.plotter is None:
+            return
+        host = self.plotter.interactor
+        self._tool_dock.adjustSize()
+        x = max(8, (host.width() - self._tool_dock.width()) // 2)
+        self._tool_dock.move(x, 8)
+        self._tool_dock.raise_()
+
+    def eventFilter(self, obj, ev):
+        if (self._tool_dock is not None and self.plotter is not None
+                and obj is self.plotter.interactor
+                and ev.type() in (QtCore.QEvent.Resize, QtCore.QEvent.Show)):
+            self._place_tool_dock()
+        return super().eventFilter(obj, ev)
+
+    def _set_tool_mode(self, mode):
+        """Switch the active viewport tool. 'faces' delegates to the face-mode
+        toggle; 'camera' detaches everything so clicks only drive the camera."""
+        self._tool_mode = mode
+        if mode == "faces":
+            if not self.face_btn.isChecked():
+                self.face_btn.setChecked(True)     # triggers _toggle_face_mode(True)
+            return
+        if self.face_btn.isChecked():
+            self.face_btn.setChecked(False)        # leaves face mode first
+        if mode == "camera":
+            self._detach_gizmo()
+            if self.plotter is not None:
+                try:
+                    self.plotter.render()
+                except Exception:
+                    pass
+        elif self._selected_hull is not None:      # gizmo mode: reattach
+            self._select_hull(self._selected_hull)
+
     def _snap_view(self, which):
         if self.plotter is None:
             return
@@ -1195,7 +1281,7 @@ class Main(QtWidgets.QMainWindow):
         self._selected_hull = i if (i is not None and 0 <= i < len(self.boxes)) else None
         for e in self.boxes:                      # refresh highlight on every hull
             self._update_hull_preview(e)
-        if self._selected_hull is not None and not self._face_mode:
+        if self._selected_hull is not None and self._tool_mode == "gizmo":
             actor = self.boxes[self._selected_hull].get("actor")
             if actor is not None:
                 try:
@@ -1233,6 +1319,7 @@ class Main(QtWidgets.QMainWindow):
             n = float(np.linalg.norm(r[:, c]))
             if n > 1e-9:
                 r[:, c] /= n
+        r = _maybe_snap_rotation(r)               # Shift = 45-degree snapping
         vb = entry["bounds"]
         ctr = np.array([(vb[0] + vb[1]) / 2.0, (vb[2] + vb[3]) / 2.0,
                         (vb[4] + vb[5]) / 2.0])
@@ -1324,6 +1411,15 @@ class Main(QtWidgets.QMainWindow):
     # ---- face mode (pick a face, push it along its normal or scale it) ----
     def _toggle_face_mode(self, on):
         self._face_mode = bool(on)
+        # keep the floating dock in sync when toggled from the side-panel button
+        btns = getattr(self, "_mode_btns", None)
+        if btns:
+            if on:
+                self._tool_mode = "faces"
+                btns["faces"].setChecked(True)
+            elif self._tool_mode == "faces":
+                self._tool_mode = "gizmo"
+                btns["gizmo"].setChecked(True)
         if self.plotter is None:
             return
         if on:
@@ -1446,6 +1542,7 @@ class Main(QtWidgets.QMainWindow):
             nrm = float(np.linalg.norm(r[:, c]))
             if nrm > 1e-9:
                 r[:, c] /= nrm
+        r = _maybe_snap_rotation(r)               # Shift = 45-degree snapping
 
         def xform(pts):
             ctr = pts.mean(axis=0)
