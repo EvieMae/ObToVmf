@@ -313,6 +313,7 @@ def _rotated_part(part, rot, center):
 # --------------------------------------------------------------------------- #
 class Main(QtWidgets.QMainWindow):
     acd_ready = QtCore.Signal(str, object)     # (model, parts|None) from CoACD worker
+    havok_ready = QtCore.Signal(str, object)   # (model, parts|"err"|None) from Havok worker
 
     def __init__(self):
         super().__init__()
@@ -344,6 +345,7 @@ class Main(QtWidgets.QMainWindow):
         self._undo_stack = []      # pre-mutation hull snapshots (Ctrl+Z)
         self._redo_stack = []      # undone snapshots (Ctrl+Y / Ctrl+Shift+Z)
         self.acd_ready.connect(self._on_acd_ready)
+        self.havok_ready.connect(self._on_havok_ready)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -2173,24 +2175,52 @@ class Main(QtWidgets.QMainWindow):
 
     def _havok_exact_pieces(self):
         """Exact collision from the NIF's Havok shell: coplanar faces -> convex
-        prisms (one per wall/floor). Precise, no CoACD, no fill — ideal for
-        awkward interiors. Stored as baked parts so the build uses them verbatim."""
+        prisms (one per wall/floor). Precise, no CoACD, no fill — ideal for awkward
+        interiors. The NIF read + decomposition run on a worker thread so the window
+        never freezes; the result comes back via havok_ready."""
         modl = self.cur_model or self._selected_model()
         if not modl:
             self._append("Select a model row first.")
             return
-        if self._nif_source() is None:
+        dd = self.getters["data_dir"]().strip() if "data_dir" in self.getters else ""
+        if not self.bsa_list and not dd:
             self._append("Add the Meshes BSA (or a loose Data dir) on the Input tab "
                          "first — the Havok collision is read from there.")
             return
-        subs = self._havok_collision_subs(modl)
-        if not subs:
-            self._append("%s has no Havok collision in its .nif." % os.path.basename(modl))
+        try:
+            scl = float(self.getters["scale"]())
+        except (ValueError, KeyError):
+            scl = 1.0
+        bsas = list(self.bsa_list)
+        self._append("Havok exact collision for %s: reading NIF + decomposing…"
+                     % os.path.basename(modl))
+
+        def work():
+            try:
+                from .bsa import DataSource
+                from . import nif
+                from .model import coplanar_convex_pieces
+                src = DataSource(data_dir=(dd or None), bsa_paths=bsas)
+                data = src.get_mesh(modl)
+                coll = nif.extract_collision(data) if data else None
+                if not coll:
+                    self.havok_ready.emit(modl, None)
+                    return
+                subs = [{"verts": [[v[0] * scl, v[1] * scl, v[2] * scl] for v in s["verts"]],
+                         "tris": [list(t) for t in s["tris"]]} for s in coll]
+                self.havok_ready.emit(modl, coplanar_convex_pieces(subs))
+            except Exception as e:
+                self.havok_ready.emit(modl, ("err", repr(e)))
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_havok_ready(self, modl, parts):
+        if isinstance(parts, tuple) and parts and parts[0] == "err":
+            self._append("Havok decomposition failed: %s" % parts[1])
             return
-        from .model import coplanar_convex_pieces
-        parts = coplanar_convex_pieces(subs)
         if not parts:
-            self._append("Could not build convex pieces (numpy required).")
+            self._append("%s has no Havok collision in its .nif (or the NIF wasn't "
+                         "found in your BSA/data dir)." % os.path.basename(modl))
             return
         row = self.model_rows.get(modl)
         if row is None:
