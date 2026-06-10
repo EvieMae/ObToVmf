@@ -745,10 +745,19 @@ class Main(QtWidgets.QMainWindow):
         self.acd_btn.clicked.connect(self._generate_acd)
         self.acd_clear_btn = QtWidgets.QPushButton("Clear ACD")
         self.acd_clear_btn.clicked.connect(self._clear_acd)
+        # cap the collision source mesh (weld + decimate) before decomposing — heavy
+        # interiors (e.g. 80k-vert Havok shells) otherwise blow up ACD/exact pieces
+        self.coll_tris = QtWidgets.QSpinBox()
+        self.coll_tris.setRange(0, 200000)
+        self.coll_tris.setSingleStep(500)
+        self.coll_tris.setValue(int(self.cfg.get("coll_tris", 4000)))
+        self.coll_tris.setToolTip("Max collision triangles: weld + decimate the "
+                                  "collision mesh to this before ACD/Havok. 0 = off.")
         rv.addWidget(_flow_row([
             QtWidgets.QLabel("Wedge rise axis"), self.wedge_axis,
             QtWidgets.QLabel("Trapezium top scale"), self.trap_top,
             QtWidgets.QLabel("Cylinder sides"), self.cyl_sides,
+            QtWidgets.QLabel("Collision tris (0=off)"), self.coll_tris,
             QtWidgets.QLabel("ACD"), self.acd_thresh, self.acd_btn, self.acd_clear_btn]))
 
         self.hull_info = QtWidgets.QLabel("Select a model row to load it. Drag the gizmo "
@@ -1172,6 +1181,13 @@ class Main(QtWidgets.QMainWindow):
                 return
             subs = [{"verts": verts, "tris": tris}]
             src = "render mesh"
+        from .model import simplify_collision, collision_vert_count
+        cap = int(self.coll_tris.value())
+        if cap > 0 and collision_vert_count(subs) > cap:
+            before = collision_vert_count(subs)
+            subs = simplify_collision(subs, target_tris=cap)
+            self._append("  simplified %s %d -> %d verts (cap %d)"
+                         % (src, before, collision_vert_count(subs), cap))
         thr = float(self.acd_thresh.value())
         self.acd_btn.setEnabled(False)
         self._append("Generating ACD for %s from the %s (threshold %.2f)…"
@@ -2218,6 +2234,7 @@ class Main(QtWidgets.QMainWindow):
             jobs = int(self.getters["jobs"]()) or None
         except (ValueError, KeyError):
             jobs = None
+        cap = int(self.coll_tris.value())
         bsas = list(self.bsa_list)
         self._append("Havok exact collision for %s: reading NIF + decomposing "
                      "(%s worker threads)…"
@@ -2227,7 +2244,8 @@ class Main(QtWidgets.QMainWindow):
             try:
                 from .bsa import DataSource
                 from . import nif
-                from .model import coplanar_convex_pieces
+                from .model import coplanar_convex_pieces, simplify_collision, \
+                    collision_vert_count
                 src = DataSource(data_dir=(dd or None), bsa_paths=bsas)
                 data = src.get_mesh(modl)
                 coll = nif.extract_collision(data) if data else None
@@ -2236,6 +2254,12 @@ class Main(QtWidgets.QMainWindow):
                     return
                 subs = [{"verts": [[v[0] * scl, v[1] * scl, v[2] * scl] for v in s["verts"]],
                          "tris": [list(t) for t in s["tris"]]} for s in coll]
+                if cap > 0 and collision_vert_count(subs) > cap:
+                    before = collision_vert_count(subs)
+                    subs = simplify_collision(subs, target_tris=cap)
+                    self.havok_ready.emit("__log__",
+                                          "  simplified collision %d -> %d verts (cap %d)"
+                                          % (before, collision_vert_count(subs), cap))
                 self.havok_ready.emit(modl, coplanar_convex_pieces(subs, jobs=jobs))
             except Exception as e:
                 self.havok_ready.emit(modl, ("err", repr(e)))
@@ -2243,6 +2267,9 @@ class Main(QtWidgets.QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_havok_ready(self, modl, parts):
+        if modl == "__log__":                        # worker progress line
+            self._append(parts)
+            return
         batch = getattr(self, "_havok_batch", None)
         if modl == "" and isinstance(parts, tuple) and parts and parts[0] == "done":
             if batch:
@@ -2577,6 +2604,7 @@ class Main(QtWidgets.QMainWindow):
         self.cfg["model_filter"] = self.model_filter.text()
         self.cfg["hide_set"] = self.hide_set.isChecked()
         self.cfg["model_overrides"] = self.ov_path.text()
+        self.cfg["coll_tris"] = self.coll_tris.value()
         self.cfg["tree_map"] = self._tree_map()
         _save(self.cfg)
 

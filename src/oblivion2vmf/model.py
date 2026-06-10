@@ -345,6 +345,41 @@ def coplanar_convex_pieces(subs, thickness=4.0, normal_tol=0.999, dist_tol=0.5,
     return parts[:max_pieces] if len(parts) > max_pieces else parts
 
 
+def collision_vert_count(subs):
+    return sum(len(s["verts"]) for s in (subs or []))
+
+
+def simplify_collision(subs, target_tris=4000, weld_eps=0.5):
+    """Reduce a heavy collision trimesh so decomposition is tractable and the result
+    is sane: (1) WELD coincident verts — Oblivion meshes are triangle soup with
+    every panel duplicated, so this alone is a huge, shape-preserving cut; (2) if
+    still over ``target_tris``, QEM-decimate with preserve_border (keeps walls /
+    silhouette). Returns simplified [{"verts","tris"}] in the same units. No-op
+    fallbacks keep it safe when pyfqmr/numpy are absent."""
+    verts, tris = [], []
+    for s in (subs or []):
+        base = len(verts)
+        verts.extend(tuple(float(c) for c in v) for v in s["verts"])
+        tris.extend((t[0] + base, t[1] + base, t[2] + base) for t in s["tris"])
+    if not tris:
+        return subs
+    wv, wf = _weld(verts, tris, eps=weld_eps)        # soup -> connected, dedup verts
+    if len(wf) > target_tris and _HAVE_FQMR and _np is not None:
+        try:
+            sim = _fqmr.Simplify()
+            sim.setMesh(_np.asarray(wv, dtype=_np.float64),
+                        _np.asarray(wf, dtype=_np.int32))
+            sim.simplify_mesh(target_count=max(64, int(target_tris)),
+                              aggressiveness=PYFQMR_AGG, preserve_border=True, verbose=0)
+            po, fo, _no = sim.getMesh()
+            if len(fo):
+                wv = [tuple(map(float, p)) for p in po.tolist()]
+                wf = [tuple(map(int, f)) for f in fo.tolist()]
+        except Exception:
+            pass
+    return [{"verts": wv, "tris": wf}]
+
+
 def _aabb(subs):
     """Axis-aligned bounds of all submesh verts as (x0,y0,z0,x1,y1,z1) in MODEL
     units (pre-scale), or None when empty."""

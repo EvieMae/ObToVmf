@@ -189,3 +189,22 @@ def test_coplanar_pieces_concave_patch_falls_back(tmp_path):
     parts = coplanar_convex_pieces([{"verts": v, "tris": tris}], thickness=2.0)
     # the L outline over-fills its convex hull, so it must NOT collapse to 1 piece
     assert len(parts) >= 2
+
+
+def test_simplify_collision_welds_soup():
+    # triangle-soup: same 2 triangles repeated with DISTINCT duplicate verts ->
+    # welding collapses them to the shared corners
+    from oblivion2vmf.model import simplify_collision, collision_vert_count
+    quad = [[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 0, 0], [10, 10, 0], [0, 10, 0]]
+    tris = [[0, 1, 2], [3, 4, 5]]
+    subs = [{"verts": quad, "tris": tris}]
+    assert collision_vert_count(subs) == 6
+    out = simplify_collision(subs, target_tris=100000)   # no decimate, just weld
+    assert collision_vert_count(out) == 4                 # 6 soup verts -> 4 corners
+    assert len(out[0]["tris"]) == 2
+
+
+def test_simplify_collision_empty_safe():
+    from oblivion2vmf.model import simplify_collision
+    assert simplify_collision([]) == []
+    assert simplify_collision(None) is None
