@@ -876,19 +876,35 @@ class Main(QtWidgets.QMainWindow):
         self._fill_table(models, "scan")
 
     def _load_compiled(self):
+        from .model import load_json_tolerant
         cache = os.path.join(self._work_dir(), ".build_cache.json")
         if not os.path.isfile(cache):
             self._append("No build cache at %s — compile a build first." % cache)
             return
+        strict = None
         try:
             with open(cache, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception as e:
-            self._append("could not read build cache: %r" % e)
+                strict = json.load(fh)
+        except ValueError:
+            strict = None                          # truncated/corrupt -> salvage below
+        # load_json_tolerant keeps every complete entry, dropping any partial tail
+        data = strict if strict is not None else load_json_tolerant(cache)
+        if not data:
+            self._append("Build cache at %s is unreadable/empty — try 'Scan models', "
+                         "or rebuild it: python -m oblivion2vmf --rebuild-cache "
+                         "(with the same model flags you build with)." % cache)
             return
+        if strict is None:                         # repair the file on disk in place
+            from .model import atomic_write_json
+            try:
+                atomic_write_json(cache, data)
+                self._append("Repaired corrupt build cache (%d entries kept)." % len(data))
+            except Exception:
+                pass
         filt = self.model_filter.text().strip().lower()
         models = [(m, 0) for m in sorted(data) if not filt or filt in m.lower()]
-        self._fill_table(models, "compiled")
+        self._fill_table(models, "compiled" if strict is not None
+                         else "compiled, SALVAGED corrupt cache")
 
     def _work_dir(self):
         out_dir = os.path.dirname(os.path.abspath(self.getters["out"]())) or "."

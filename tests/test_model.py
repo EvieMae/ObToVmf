@@ -172,3 +172,24 @@ def test_placeholder_material(tmp_path):
     assert os.path.isfile(os.path.join(d, model.PLACEHOLDER_MATERIAL + ".vtf"))
     vmt = open(os.path.join(d, model.PLACEHOLDER_MATERIAL + ".vmt")).read()
     assert "VertexLitGeneric" in vmt
+
+
+def test_load_json_tolerant_salvages_truncated_cache(tmp_path):
+    from oblivion2vmf.model import load_json_tolerant, atomic_write_json
+    full = {"a/b.nif": {"sig": "1", "model_path": "x"},
+            "c/d.nif": {"sig": "2", "model_path": "y"},
+            "e/f.nif": {"sig": "3", "model_path": "z"}}
+    p = tmp_path / "cache.json"
+    atomic_write_json(str(p), full)
+    assert load_json_tolerant(str(p)) == full          # intact round-trips
+
+    # simulate a kill mid-write: truncate inside the last entry
+    text = p.read_text()
+    cut = text.rfind("z")                              # mid last value
+    p.write_text(text[:cut])
+    salvaged = load_json_tolerant(str(p))
+    assert "a/b.nif" in salvaged and "c/d.nif" in salvaged   # complete entries kept
+    assert "e/f.nif" not in salvaged                   # partial tail dropped
+    assert load_json_tolerant(str(tmp_path / "missing.json")) == {}
+    (tmp_path / "junk.json").write_text("not json at all {{{")
+    assert load_json_tolerant(str(tmp_path / "junk.json")) == {}

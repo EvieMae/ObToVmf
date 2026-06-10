@@ -44,6 +44,45 @@ from . import nif
 from .dds import dds_to_vtf
 from .textures import write_vtf
 
+
+def atomic_write_json(path, obj):
+    """Write JSON to ``path`` atomically (temp file + os.replace) so a crash or
+    kill mid-write can never leave a truncated/corrupt file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)                  # atomic on the same filesystem
+
+
+def load_json_tolerant(path):
+    """Load a JSON dict, salvaging a truncated dict-of-objects file (e.g. a build
+    cache killed mid-write): drop the trailing partial entry and re-close. Returns
+    the dict, or {} if nothing parses. Logs nothing — callers report as needed."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    # salvage: keep trimming back to an earlier inner-object close and re-close the
+    # outer dict until it parses (handles a write cut off inside the last entries)
+    end = len(text)
+    for _ in range(64):
+        cut = text.rfind("}", 0, end)
+        if cut == -1:
+            break
+        try:
+            return json.loads(text[:cut + 1] + "}")
+        except ValueError:
+            end = cut
+    return {}
+
+
 # Gamebryo/NIF is DirectX-based (CW front faces), same as Source -> do NOT reverse
 # winding by default. NIF UV origin is top-left vs Source bottom-left -> flip V.
 FLIP_WINDING = False
@@ -958,11 +997,7 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
     cache_path = os.path.join(work_dir, ".build_cache.json")
     cache = {}
     if use_cache and not cache_rebuild:
-        try:
-            with open(cache_path, encoding="utf-8") as f:
-                cache = json.load(f)
-        except Exception:
-            cache = {}
+        cache = load_json_tolerant(cache_path) or {}
     cache_lock = threading.Lock()
     # Limit concurrent CoACD calls. CoACD now runs in isolated subprocesses, so the
     # cap is just a memory/CPU budget (no crash risk). Default min(n_jobs,
@@ -979,8 +1014,7 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
         with cache_lock:
             cache[modl] = entry
             try:
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    json.dump(cache, f)
+                atomic_write_json(cache_path, cache)
             except Exception:
                 pass
 
