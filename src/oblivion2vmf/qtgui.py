@@ -476,6 +476,14 @@ class Main(QtWidgets.QMainWindow):
         ab.addWidget(self.acd_clear_btn)
         ab.addStretch(1)
         rv.addLayout(ab)
+
+        # inspector: one checkable row per scene piece (model / ACD / hulls)
+        self.inspector = QtWidgets.QListWidget()
+        self.inspector.setMaximumHeight(140)
+        self.inspector.itemChanged.connect(self._on_inspector_toggle)
+        self.inspector.itemClicked.connect(self._on_inspector_clicked)
+        rv.addWidget(self.inspector)
+
         self.hull_info = QtWidgets.QLabel("Select a model row to load it. Drag box handles to "
                                           "resize, drag the body to move. Stack boxes for "
                                           "concave shapes.")
@@ -768,6 +776,7 @@ class Main(QtWidgets.QMainWindow):
         if not os.path.isfile(smd):
             self.hull_info.setText("No compiled SMD for this model at %s — build it first." % smd)
             self.plotter.render()
+            self._refresh_inspector()
             return
         groups = read_smd_grouped(smd)
         all_pts, ntri, ntex = [], 0, 0
@@ -800,6 +809,7 @@ class Main(QtWidgets.QMainWindow):
         self.plotter.render()
         self.hull_info.setText("%s — %d tri(s), %d/%d material(s) textured, %d hull(s)."
                                % (os.path.basename(modl), ntri, ntex, len(groups), len(self.boxes)))
+        self._refresh_inspector()
 
     # ---- CoACD generation / preview ----
     def _generate_acd(self):
@@ -844,6 +854,7 @@ class Main(QtWidgets.QMainWindow):
             self.plotter.render()
         self._append("ACD: %d convex part(s) for %s → row set to 'acd' (Save overrides to "
                      "bake exactly these). " % (len(parts), os.path.basename(modl)))
+        self._refresh_inspector()
 
     _ACD_COLORS = ["#ff7043", "#ffca28", "#9ccc65", "#26c6da", "#ab47bc",
                    "#ec407a", "#7e57c2", "#5c6bc0", "#66bb6a", "#ffa726"]
@@ -878,6 +889,7 @@ class Main(QtWidgets.QMainWindow):
         if self.plotter is not None:
             self.plotter.render()
         self._append("Cleared ACD preview/parts for the current model.")
+        self._refresh_inspector()
 
     # ---- export ----
     def _export_data(self):
@@ -1011,6 +1023,7 @@ class Main(QtWidgets.QMainWindow):
                         top_scale=float(self.trap_top.value()),
                         sides=int(self.cyl_sides.currentText()))
         self.plotter.render()
+        self._refresh_inspector()
 
     def _remove_box(self):
         if self.plotter is not None and self.boxes:
@@ -1020,6 +1033,7 @@ class Main(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self._respawn_boxes()
+            self._refresh_inspector()
 
     def _fit_box(self):
         if self.plotter is not None and self.boxes and hasattr(self, "bb"):
@@ -1158,6 +1172,113 @@ class Main(QtWidgets.QMainWindow):
             "QPushButton:hover { background:#39424f; }"
             "QTabBar::tab { background:#1b1f25; padding:6px 12px; }"
             "QTabBar::tab:selected { background:#2d3640; }")
+
+    # ---- inspector (scene list with eyeball visibility toggles) ----
+    def _scene_actors(self):
+        """Snapshot {name: vtkActor}; empty when there is no live plotter."""
+        if self.plotter is None:
+            return {}
+        try:
+            return dict(self.plotter.renderer.actors)
+        except Exception:
+            return {}
+
+    def _group_visible(self, kind, idx, actors):
+        """Current visibility of a group so a rebuilt list reflects the scene."""
+        def first(pred):
+            for name, a in actors.items():
+                if pred(name):
+                    try:
+                        return bool(a.GetVisibility())
+                    except Exception:
+                        return True
+            return None
+        if kind == "model":
+            v = first(lambda n: n.startswith("m_") or n.startswith("flat_"))
+        elif kind == "acd":
+            v = first(lambda n: n.startswith("acd_"))
+        else:
+            e = self.boxes[idx]
+            v = first(lambda n: n == e.get("name"))
+            if v is None and e.get("widget") is not None:
+                try:
+                    v = bool(e["widget"].GetEnabled())
+                except Exception:
+                    v = None
+        return True if v is None else v
+
+    def _refresh_inspector(self):
+        """Rebuild the inspector rows from the current scene contents."""
+        lw = getattr(self, "inspector", None)
+        if lw is None:
+            return
+        actors = self._scene_actors()
+        lw.blockSignals(True)
+        lw.clear()
+
+        def add(label, kind, idx=-1):
+            it = QtWidgets.QListWidgetItem("\U0001f441 " + label)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if self._group_visible(kind, idx, actors)
+                             else Qt.Unchecked)
+            it.setData(Qt.UserRole, (kind, idx))
+            lw.addItem(it)
+        add("Model", "model")
+        if getattr(self, "acd_actors", None):
+            add("ACD preview", "acd")
+        for i, e in enumerate(self.boxes):
+            add("%s %d" % (e.get("type", "box"), i + 1), "hull", i)
+        lw.blockSignals(False)
+
+    def _on_inspector_toggle(self, item):
+        """Checkbox flipped: show/hide every actor (and widget) of that group."""
+        role = item.data(Qt.UserRole)
+        if not role:
+            return
+        kind, idx = role
+        on = item.checkState() == Qt.Checked
+        actors = self._scene_actors()
+
+        def show(pred):
+            for name, a in actors.items():
+                if pred(name):
+                    try:
+                        a.SetVisibility(1 if on else 0)
+                    except Exception:
+                        pass
+        if kind == "model":
+            show(lambda n: n.startswith("m_") or n.startswith("flat_"))
+        elif kind == "acd":
+            show(lambda n: n.startswith("acd_"))
+        elif kind == "hull" and 0 <= idx < len(self.boxes):
+            e = self.boxes[idx]
+            show(lambda n: n == e.get("name"))
+            if e.get("actor") is not None:                 # optional, set by merges
+                try:
+                    e["actor"].SetVisibility(1 if on else 0)
+                except Exception:
+                    pass
+            if e.get("widget") is not None:
+                try:
+                    (e["widget"].On if on else e["widget"].Off)()
+                except Exception:
+                    pass
+        if self.plotter is not None:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
+    def _on_inspector_clicked(self, item):
+        """Selecting a hull row selects that hull (defer to _select_hull if present)."""
+        role = item.data(Qt.UserRole)
+        if not role or role[0] != "hull":
+            return
+        i = role[1]
+        if hasattr(self, "_select_hull"):
+            self._select_hull(i)
+        else:
+            self._selected_hull = i
 
 
 def main():
