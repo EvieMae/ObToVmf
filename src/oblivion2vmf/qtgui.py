@@ -1394,22 +1394,74 @@ class Main(QtWidgets.QMainWindow):
         if len(idx) < 3 or not face_tris:
             self._append("Pick a face on the SELECTED hull (model faces don't count).")
             return
-        self._face_sel = {"hull": i, "idx": idx, "normal": n.tolist()}
-        try:                                       # highlight the face
+        self._face_sel = {"hull": i, "idx": idx,
+                          "tris": [list(f) for f in face_tris],
+                          "normal": n.tolist()}
+        self._show_face_highlight()
+        self._append("Face selected: %d vert(s); drag the gizmo (arrows move, rings "
+                     "tilt) or use the Face mode buttons." % len(idx))
+
+    def _show_face_highlight(self):
+        """(Re)draw the selected face's highlight actor and hang the Blender-style
+        transform gizmo off it — dragging the gizmo edits THE FACE, not the hull."""
+        fs = self._face_sel
+        if fs is None or self.plotter is None:
+            return
+        i = fs["hull"]
+        if not (0 <= i < len(self.boxes)):
+            return
+        self._detach_gizmo()
+        verts = np.asarray(self.boxes[i]["verts"], dtype=float)
+        idx = fs["idx"]
+        try:
             fpts = verts[idx]
             cells = []
             remap = {v: j for j, v in enumerate(idx)}
-            for f in face_tris:
+            for f in fs["tris"]:
                 cells.extend([3, remap[f[0]], remap[f[1]], remap[f[2]]])
-            self.plotter.add_mesh(pv.PolyData(fpts, np.asarray(cells, dtype=np.int64)),
-                                  color="#ffeb3b", opacity=0.9, name="face_sel")
+            actor = self.plotter.add_mesh(
+                pv.PolyData(fpts, np.asarray(cells, dtype=np.int64)),
+                color="#ffeb3b", opacity=0.9, name="face_sel")
+            self._gizmo = self.plotter.add_affine_transform_widget(
+                actor, release_callback=self._on_face_gizmo_release)
+            fs["actor"] = actor
             self.plotter.render()
         except Exception:
             pass
-        self._append("Face selected: %d vert(s); use Move along normal / Scale face."
-                     % len(idx))
+
+    def _on_face_gizmo_release(self, *_args):
+        """Bake the face gizmo's transform into the face verts: translation moves
+        the face, rotation tilts it about its own centroid."""
+        fs = self._face_sel
+        if fs is None or fs.get("actor") is None:
+            return
+        try:
+            m = np.array(fs["actor"].user_matrix, dtype=float).reshape(4, 4)
+        except Exception:
+            return
+        if np.allclose(m, np.eye(4)):
+            return
+        r = m[:3, :3].copy()
+        for c in range(3):                        # strip widget scale
+            nrm = float(np.linalg.norm(r[:, c]))
+            if nrm > 1e-9:
+                r[:, c] /= nrm
+
+        def xform(pts):
+            ctr = pts.mean(axis=0)
+            # face centroid through the full affine; rotation about the centroid
+            t = r @ ctr + m[:3, 3] - ctr
+            return (pts - ctr) @ r.T + ctr + t
+        fs["normal"] = (r @ np.asarray(fs["normal"], dtype=float)).tolist()
+        try:
+            fs["actor"].user_matrix = np.eye(4)
+        except Exception:
+            pass
+        self._apply_face_edit(xform)              # keeps the face selected
 
     def _clear_face_sel(self):
+        if self._face_sel is not None and self._face_sel.get("actor") is not None:
+            self._detach_gizmo()                  # the gizmo hangs off the face actor
         self._face_sel = None
         if self.plotter is not None:
             try:
@@ -1418,8 +1470,9 @@ class Main(QtWidgets.QMainWindow):
                 pass
 
     def _apply_face_edit(self, transform):
-        """Shared plumbing for the face buttons: undo snapshot, edit the selected
-        face's verts, refresh geometry + bounds + highlight."""
+        """Shared plumbing for face edits (gizmo + buttons): undo snapshot, edit the
+        selected face's verts, refresh geometry + highlight; the face STAYS selected
+        so consecutive gizmo drags chain naturally."""
         fs = self._face_sel
         if fs is None:
             self._append("Face mode: select a face first.")
@@ -1437,8 +1490,10 @@ class Main(QtWidgets.QMainWindow):
                        float(v[:, 1].min()), float(v[:, 1].max()),
                        float(v[:, 2].min()), float(v[:, 2].max()))
         self._update_hull_preview(e)
-        self._clear_face_sel()                    # geometry moved; re-pick to continue
         self._load_transform_panel()
+        # rebuild the highlight + gizmo at the face's new position, deferred so the
+        # widget isn't torn down inside its own VTK release observer
+        QtCore.QTimer.singleShot(0, self._show_face_highlight)
         try:
             self.plotter.render()
         except Exception:
