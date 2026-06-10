@@ -241,7 +241,7 @@ def _prism(poly3d, normal, thickness):
 
 
 def coplanar_convex_pieces(subs, thickness=4.0, normal_tol=0.999, dist_tol=0.5,
-                           area_slack=0.08, max_pieces=4000, jobs=None):
+                           area_slack=0.08, max_pieces=1200, jobs=None):
     """Convert a Havok collision trimesh into ACCURATE convex pieces by grouping
     coplanar, edge-connected triangles into patches and extruding each patch's
     convex outline into a thin solid prism. Flat walls/floors become ONE exact
@@ -1404,6 +1404,11 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 # Convex parts authored/previewed in the GUI 3D editor — bake them
                 # verbatim (final SMD units, scale 1.0) instead of recomputing CoACD.
                 parts = [(pv_, [tuple(f) for f in pf]) for pv_, pf in ov["acd_parts"]]
+                cverts = sum(len(pv_) for pv_, _ in parts)
+                if cverts > 30000:
+                    res["logs"].append("[warn] %s collision is %d verts (>32768 limit) "
+                                       "-> will error in-engine; regenerate with a lower "
+                                       "'Collision tris' in the editor." % (slug, cverts))
                 if parts:
                     write_collision_smd(parts, phys, scale=1.0)
                     coll_smd, maxc = phys, max(64, len(parts) + 8)
@@ -1415,7 +1420,7 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 # would seal them). Weld+decimate first so heavy shells don't explode
                 # into thousands of pieces. 1 worker — build_models parallelises across
                 # meshes already.
-                hsubs = simplify_collision(coll_subs, target_tris=2000)
+                hsubs = simplify_collision(coll_subs, target_tris=1000)
                 parts = coplanar_convex_pieces(hsubs, jobs=1) or []
                 if parts:
                     write_collision_smd(parts, phys, scale=m_scale)

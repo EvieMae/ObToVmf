@@ -750,7 +750,7 @@ class Main(QtWidgets.QMainWindow):
         self.coll_tris = QtWidgets.QSpinBox()
         self.coll_tris.setRange(0, 200000)
         self.coll_tris.setSingleStep(500)
-        self.coll_tris.setValue(int(self.cfg.get("coll_tris", 2000)))
+        self.coll_tris.setValue(int(self.cfg.get("coll_tris", 1000)))
         self.coll_tris.setToolTip("Max collision triangles: weld + decimate the "
                                   "collision mesh to this before ACD/Havok. 0 = off.")
         rv.addWidget(_flow_row([
@@ -1216,7 +1216,21 @@ class Main(QtWidgets.QMainWindow):
             self.plotter.render()
         self._append("ACD: %d convex part(s) for %s → row set to 'acd' (Save overrides to "
                      "bake exactly these). " % (len(parts), os.path.basename(modl)))
+        self._warn_collision_verts(parts)
         self._refresh_inspector()
+
+    def _warn_collision_verts(self, parts):
+        """Source caps a model's vertex buffer at 32768; collision pieces count too.
+        Warn (loudly) when a decomposition is heading past that — lower 'Collision
+        tris' and regenerate."""
+        nv = sum(len(pv_) for pv_, _pf in parts)
+        if nv > 24000:
+            self._append("[WARNING] this collision is %d verts — Source's limit is "
+                         "32768 and it WILL error ('dynamic vertex buffer'). Lower "
+                         "'Collision tris' (try 600-1000) and regenerate." % nv)
+        elif nv > 12000:
+            self._append("  (collision %d verts — getting heavy; consider a lower "
+                         "'Collision tris')" % nv)
 
     _ACD_COLORS = ["#ff7043", "#ffca28", "#9ccc65", "#26c6da", "#ab47bc",
                    "#ec407a", "#7e57c2", "#5c6bc0", "#66bb6a", "#ffa726"]
@@ -1786,6 +1800,11 @@ class Main(QtWidgets.QMainWindow):
         if on:
             self._detach_gizmo()
             self._detach_scale_widget()
+            # Rebuild every hull's actor from its stored spec so any leftover
+            # widget transform (the move/rotate/scale gizmos write a user_matrix on
+            # the actor) is wiped — otherwise the hull can look scaled/moved when
+            # face mode takes over. _spawn_box re-creates clean actors.
+            self._respawn_boxes()
             # IMPORTANT: we do NOT use pyvista's enable_*_picking — it swaps the
             # interactor to a trackball-derived picking style. Instead we keep the
             # terrain camera and pick faces ourselves with a vtkCellPicker on a
@@ -1862,10 +1881,14 @@ class Main(QtWidgets.QMainWindow):
         part = self._hull_part(self._entry_spec(e))
         if part is None:
             return False
-        e["verts"] = [list(v) for v in part[0]]
+        v = np.asarray(part[0], dtype=float)
+        e["verts"] = [list(p) for p in v]
         e["faces"] = [list(f) for f in part[1]]
         e["type"] = "mesh"
         e["rot"] = [0.0, 0.0, 0.0]                # rotation now baked into verts
+        e["bounds"] = (float(v[:, 0].min()), float(v[:, 0].max()),   # keep in sync
+                       float(v[:, 1].min()), float(v[:, 1].max()),
+                       float(v[:, 2].min()), float(v[:, 2].max()))
         return True
 
     def _on_face_pick(self, pts):
@@ -2311,9 +2334,9 @@ class Main(QtWidgets.QMainWindow):
                "Save overrides to keep them." % (os.path.basename(modl), len(parts)))
         if len(parts) > 256:
             msg += (" [warning] that's a lot of pieces — this mesh is curved/detailed, "
-                    "not flat-walled, so exact mode isn't ideal here. Prefer 'Generate "
-                    "ACD' (CoACD) for fewer, cleaner hulls.")
+                    "not flat-walled. Lower 'Collision tris' and regenerate for fewer.")
         self._append(msg)
+        self._warn_collision_verts(parts)
         if modl == self.cur_model and self.plotter is not None:
             self.cur_model = None
             self._load_model_3d(modl)
