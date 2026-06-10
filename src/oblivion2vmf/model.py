@@ -1405,7 +1405,17 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             big = _horizontal_extent(subs, m_scale) > collision_size
             phys = os.path.join(work_dir, slug + "_phys.smd")
             coll_smd, maxc = None, 64
-            if ov.get("acd_parts"):
+            if m_collision == "hulls" and ov.get("hulls"):
+                # Hand-authored hulls take PRECEDENCE over any stale baked acd_parts
+                # left in the override from earlier experiments — the user's explicit
+                # shapes are the point of 'hulls' mode. (Branch duplicated below for
+                # when no hulls exist.)
+                parts = [p for p in (hull_from_spec(s) for s in ov["hulls"])
+                         if p is not None]
+                if parts:
+                    write_collision_smd(parts, phys, scale=1.0)
+                    coll_smd, maxc = phys, max(64, len(parts) + 8)
+            elif ov.get("acd_parts"):
                 # Convex parts authored/previewed in the GUI 3D editor — bake them
                 # verbatim (final SMD units, scale 1.0) instead of recomputing CoACD.
                 parts = [(pv_, [tuple(f) for f in pf]) for pv_, pf in ov["acd_parts"]]

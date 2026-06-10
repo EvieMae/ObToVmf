@@ -196,10 +196,15 @@ argv = sys.argv[sys.argv.index("--") + 1:]
 REF_OBJ, OUT_JSON = argv[0], argv[1]
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
+# IDENTITY axes: Blender's default OBJ conversion (-Z forward / Y up) re-maps the
+# coordinates on import, but our save-back reads raw world coords — the round trip
+# would come back rotated/flipped. forward=Y, up=Z imports our Z-up coords as-is.
 try:
-    bpy.ops.wm.obj_import(filepath=REF_OBJ)        # Blender 4.x
+    bpy.ops.wm.obj_import(filepath=REF_OBJ,        # Blender 4.x
+                          forward_axis='Y', up_axis='Z')
 except Exception:
-    bpy.ops.import_scene.obj(filepath=REF_OBJ)     # Blender 3.x
+    bpy.ops.import_scene.obj(filepath=REF_OBJ,     # Blender 3.x
+                             axis_forward='Y', axis_up='Z')
 for o in list(bpy.context.selected_objects):
     o.name = "reference"
     o.display_type = "WIRE"
