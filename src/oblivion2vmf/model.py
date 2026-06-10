@@ -1405,16 +1405,18 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             big = _horizontal_extent(subs, m_scale) > collision_size
             phys = os.path.join(work_dir, slug + "_phys.smd")
             coll_smd, maxc = None, 64
-            if m_collision == "hulls" and ov.get("hulls"):
-                # Hand-authored hulls take PRECEDENCE over any stale baked acd_parts
-                # left in the override from earlier experiments — the user's explicit
-                # shapes are the point of 'hulls' mode. (Branch duplicated below for
-                # when no hulls exist.)
-                parts = [p for p in (hull_from_spec(s) for s in ov["hulls"])
+            if m_collision == "hulls":
+                # Explicit hulls mode: ONLY the hand-authored hulls count — baked
+                # acd_parts in the same override are ignored entirely (no hulls
+                # defined = no collision, never a silent ACD fallback).
+                parts = [p for p in (hull_from_spec(s) for s in (ov.get("hulls") or []))
                          if p is not None]
                 if parts:
                     write_collision_smd(parts, phys, scale=1.0)
                     coll_smd, maxc = phys, max(64, len(parts) + 8)
+                elif ov.get("acd_parts"):
+                    res["logs"].append("    %s: hulls mode, no hulls defined -> NO "
+                                       "collision (ignoring stale acd_parts)" % slug)
             elif ov.get("acd_parts"):
                 # Convex parts authored/previewed in the GUI 3D editor — bake them
                 # verbatim (final SMD units, scale 1.0) instead of recomputing CoACD.
@@ -1439,15 +1441,6 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 parts = coplanar_convex_pieces(hsubs, jobs=1) or []
                 if parts:
                     write_collision_smd(parts, phys, scale=m_scale)
-                    coll_smd, maxc = phys, max(64, len(parts) + 8)
-            elif m_collision == "hulls":
-                # Multiple hand-authored hulls (GUI 3D editor): boxes, wedges, or
-                # trapezoidal prisms. Coords are in FINAL (SMD/Hammer) units ->
-                # written as-is (scale 1.0).
-                parts = [p for p in (hull_from_spec(s) for s in (ov.get("hulls") or []))
-                         if p is not None]
-                if parts:
-                    write_collision_smd(parts, phys, scale=1.0)
                     coll_smd, maxc = phys, max(64, len(parts) + 8)
             elif m_collision in ("bbox", "ramp"):
                 # Single convex primitive sized to the mesh bounds: a box (cheap
