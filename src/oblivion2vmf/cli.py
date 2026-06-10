@@ -806,16 +806,21 @@ def _build_interior(args, esm):
     out_parent = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_parent, exist_ok=True)
 
-    # Interiors are walked INTO, not past: the room shell must be SOLID or the
-    # player falls through the floor onto the sealed box below and can't move.
-    # 'auto' (big meshes non-solid) is an exterior default — remap it to 'full'
-    # (prop_static supports concave per-triangle collision). Explicit
-    # none/acd/full are respected.
+    # Interiors are CLOSED shells you stand INSIDE, so the usual modes seal you out:
+    # 'full' convex-hulls the connected room into one solid block, and 'acd'/CoACD
+    # decomposes the *enclosed volume* of a closed mesh -> also solid. 'havok'
+    # extrudes each wall surface into a THIN slab, leaving the interior empty
+    # (walk-in by construction) -> the right default for rooms. Explicit modes win.
     if args.collision == "auto":
-        args.collision = "full"
-        print("[note] interior: using --collision full (solid room shell so you can "
-              "walk on floors / be blocked by walls). Pass --collision none for "
-              "walk-through, or acd for decomposed walk-in.")
+        args.collision = "havok"
+        print("[note] interior: using --collision havok (each wall -> a thin solid "
+              "slab so you can stand inside the room). 'full'/'acd' would seal a "
+              "closed room solid; pass --collision none for walk-through.")
+    elif args.collision in ("acd", "full"):
+        print("[warn] --collision %s on a CLOSED interior room usually SEALS it "
+              "(you can't enter): 'full' convex-hulls the room solid; 'acd' fills "
+              "the enclosed volume. Use --collision havok for walk-in rooms."
+              % args.collision)
 
     shim = _InteriorShim(refs, ex.base_models)
     placements = model_map = model_scale = None
