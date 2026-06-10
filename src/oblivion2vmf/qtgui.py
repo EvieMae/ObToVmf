@@ -750,7 +750,7 @@ class Main(QtWidgets.QMainWindow):
         self.coll_tris = QtWidgets.QSpinBox()
         self.coll_tris.setRange(0, 200000)
         self.coll_tris.setSingleStep(500)
-        self.coll_tris.setValue(int(self.cfg.get("coll_tris", 4000)))
+        self.coll_tris.setValue(int(self.cfg.get("coll_tris", 2000)))
         self.coll_tris.setToolTip("Max collision triangles: weld + decimate the "
                                   "collision mesh to this before ACD/Havok. 0 = off.")
         rv.addWidget(_flow_row([

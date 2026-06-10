@@ -1322,7 +1322,7 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 # would seal them). Weld+decimate first so heavy shells don't explode
                 # into thousands of pieces. 1 worker — build_models parallelises across
                 # meshes already.
-                hsubs = simplify_collision(coll_subs, target_tris=4000)
+                hsubs = simplify_collision(coll_subs, target_tris=2000)
                 parts = coplanar_convex_pieces(hsubs, jobs=1) or []
                 if parts:
                     write_collision_smd(parts, phys, scale=m_scale)
