@@ -1605,17 +1605,26 @@ class Main(QtWidgets.QMainWindow):
 
     def _attach_scale_widget(self, i):
         """Scale tool: a box cage whose face handles resize the hull (drag a face to
-        push it, drag the body to move). Reuses add_box_widget — no rotation."""
+        push it, drag the body to move). Reuses add_box_widget — no rotation.
+
+        CRITICAL: factor=1.0 — pyvista's default factor=1.25 places the cage 25%
+        LARGER than the given bounds AND fires the callback once at placement, so
+        every attach would write inflated bounds back onto the hull (the 'spam
+        clicking grows the shape' bug). The placement callback is also skipped."""
         if self.plotter is None or not (0 <= i < len(self.boxes)):
             return
         self._detach_scale_widget()
         vb = self.boxes[i]["bounds"]
+        first = {"placing": True}
 
         def cb(box, widget):
+            if first["placing"]:                   # placement callback, not a drag
+                first["placing"] = False
+                return
             self._on_scale_box(i, tuple(box.bounds))
         try:
             self._scale_widget = self.plotter.add_box_widget(
-                cb, bounds=vb, rotation_enabled=False, pass_widget=True,
+                cb, bounds=vb, factor=1.0, rotation_enabled=False, pass_widget=True,
                 color="#46c0ff")
         except Exception:
             self._scale_widget = None
