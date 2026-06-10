@@ -270,21 +270,36 @@ def hull_from_spec(spec):
     (any dict shape, about the bounds centre)}. Returns (verts, faces) or None
     for a malformed spec."""
     if isinstance(spec, dict):
-        b = spec.get("bounds") or []
-        if len(b) != 6:
-            return None
-        b = tuple(float(c) for c in b)
         t = (spec.get("type") or "box").lower()
-        if t == "wedge":
-            part = ramp_hull(b, spec.get("axis", "+x"))
-        elif t in ("trap", "trapezoid", "trapezium"):
-            part = trap_hull(b, spec.get("top_scale", 0.5))
-        elif t == "cylinder":
-            part = cylinder_hull(b, spec.get("sides", 12))
-        elif t == "plane":
-            part = plane_hull(b, spec.get("thickness", 2.0))
+        if t == "mesh":
+            # explicit geometry (from the GUI's face-edit mode): verts + faces
+            # stored verbatim; bounds derived for the shared rot pivot below.
+            try:
+                verts = [tuple(float(c) for c in v) for v in (spec.get("verts") or [])]
+                faces = [tuple(int(i) for i in f) for f in (spec.get("faces") or [])]
+            except (TypeError, ValueError):
+                return None
+            if len(verts) < 4 or not faces:
+                return None
+            part = (verts, faces)
+            xs = [v[0] for v in verts]; ys = [v[1] for v in verts]
+            zs = [v[2] for v in verts]
+            b = (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
         else:
-            part = box_hull(b)
+            b = spec.get("bounds") or []
+            if len(b) != 6:
+                return None
+            b = tuple(float(c) for c in b)
+            if t == "wedge":
+                part = ramp_hull(b, spec.get("axis", "+x"))
+            elif t in ("trap", "trapezoid", "trapezium"):
+                part = trap_hull(b, spec.get("top_scale", 0.5))
+            elif t == "cylinder":
+                part = cylinder_hull(b, spec.get("sides", 12))
+            elif t == "plane":
+                part = plane_hull(b, spec.get("thickness", 2.0))
+            else:
+                part = box_hull(b)
         rot = spec.get("rot")
         if rot:
             try:

@@ -163,6 +163,9 @@ class Main(QtWidgets.QMainWindow):
         self.boxes = []            # [{widget, bounds}] active hull widgets
         self._selected_hull = None  # index into self.boxes (gizmo target)
         self._gizmo = None          # the single affine-transform widget
+        self._face_sel = None       # {"idx": [vert indices], "normal": np3} in face mode
+        self._face_mode = False
+        self._xf_loading = False    # guard: transform panel being populated
         self.acd_actors = []       # named actors of the current ACD preview
         self.cur_model = None      # nif currently loaded in the 3D view
         self._undo_stack = []      # pre-mutation hull snapshots (Ctrl+Z)
@@ -173,7 +176,7 @@ class Main(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         outer = QtWidgets.QVBoxLayout(central)
         self.tabs = QtWidgets.QTabWidget()
-        outer.addWidget(self.tabs, 1)
+        outer.addWidget(self.tabs, 3)            # log gets 1/4 of the height, not 1/2
         self._tab_main()
         self._tab_models()
         self._tab_trees()
@@ -442,13 +445,74 @@ class Main(QtWidgets.QMainWindow):
         lv.addWidget(self.table, 1)
         split.addWidget(left)
 
-        # right: 3D viewport + hull controls
+        # right: slim hierarchy/transform column + 3D viewport, side by side so the
+        # scene list never eats viewport height
         right = QtWidgets.QWidget()
-        rv = QtWidgets.QVBoxLayout(right)
+        rh = QtWidgets.QHBoxLayout(right)
+
+        side = QtWidgets.QWidget()
+        side.setMaximumWidth(240)
+        sv = QtWidgets.QVBoxLayout(side)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.addWidget(QtWidgets.QLabel("Hierarchy"))
+        self.inspector = QtWidgets.QListWidget()
+        self.inspector.itemChanged.connect(self._on_inspector_toggle)
+        self.inspector.itemClicked.connect(self._on_inspector_clicked)
+        sv.addWidget(self.inspector, 1)
+
+        # transform panel: numeric move / scale / rotation for the selected hull
+        tg = QtWidgets.QGroupBox("Transform")
+        tf = QtWidgets.QFormLayout(tg)
+        self._xf = {}
+        for key, lab in (("pos", "Move (centre)"), ("size", "Scale (size)"),
+                         ("rot", "Rotation (deg)")):
+            row = QtWidgets.QHBoxLayout()
+            triple = []
+            for _ax in "XYZ":
+                s = QtWidgets.QDoubleSpinBox()
+                s.setRange(-1e6, 1e6)
+                s.setDecimals(2)
+                s.setSingleStep(8.0 if key != "rot" else 5.0)
+                s.setMaximumWidth(70)
+                s.valueChanged.connect(self._apply_transform_panel)
+                row.addWidget(s)
+                triple.append(s)
+            self._xf[key] = triple
+            w = QtWidgets.QWidget()
+            w.setLayout(row)
+            tf.addRow(lab, w)
+        sv.addWidget(tg)
+
+        # face mode: click a face on the selected hull, then push/scale it
+        fg = QtWidgets.QGroupBox("Face mode")
+        ff = QtWidgets.QFormLayout(fg)
+        self.face_btn = QtWidgets.QPushButton("Select faces")
+        self.face_btn.setCheckable(True)
+        self.face_btn.toggled.connect(self._toggle_face_mode)
+        ff.addRow(self.face_btn)
+        self.face_offset = QtWidgets.QDoubleSpinBox()
+        self.face_offset.setRange(-1e5, 1e5)
+        self.face_offset.setValue(16.0)
+        mvb = QtWidgets.QPushButton("Move along normal")
+        mvb.clicked.connect(self._face_move)
+        ff.addRow(self.face_offset, mvb)
+        self.face_scale = QtWidgets.QDoubleSpinBox()
+        self.face_scale.setRange(0.05, 20.0)
+        self.face_scale.setSingleStep(0.05)
+        self.face_scale.setValue(0.5)
+        scb = QtWidgets.QPushButton("Scale face")
+        scb.clicked.connect(self._face_scale_apply)
+        ff.addRow(self.face_scale, scb)
+        sv.addWidget(fg)
+        rh.addWidget(side)
+
+        view = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(view)
+        rv.setContentsMargins(0, 0, 0, 0)
         self.plotter = None
         if _HAVE_3D:
             try:
-                self.plotter = QtInteractor(right)
+                self.plotter = QtInteractor(view)
                 rv.addWidget(self.plotter.interactor, 1)
                 self._style_viewport()
                 # terrain interaction: orbit = azimuth + elevation only (the camera
@@ -505,41 +569,31 @@ class Main(QtWidgets.QMainWindow):
         self.cyl_sides.addItems(["8", "12", "16"])
         self.cyl_sides.setCurrentText("12")
         sb.addWidget(self.cyl_sides)
-        sb.addStretch(1)
-        rv.addLayout(sb)
-
-        # CoACD convex-decomposition row
-        ab = QtWidgets.QHBoxLayout()
-        ab.addWidget(QtWidgets.QLabel("ACD threshold"))
+        # CoACD convex-decomposition controls share the row
+        sb.addWidget(QtWidgets.QLabel("ACD"))
         self.acd_thresh = QtWidgets.QDoubleSpinBox()
         self.acd_thresh.setRange(0.01, 1.0)
         self.acd_thresh.setSingleStep(0.01)
         self.acd_thresh.setDecimals(2)
         self.acd_thresh.setValue(float(self.cfg.get("acd_threshold", 0.08) or 0.08))
-        ab.addWidget(self.acd_thresh)
+        sb.addWidget(self.acd_thresh)
         self.acd_btn = QtWidgets.QPushButton("Generate ACD")
         self.acd_btn.clicked.connect(self._generate_acd)
-        ab.addWidget(self.acd_btn)
+        sb.addWidget(self.acd_btn)
         self.acd_clear_btn = QtWidgets.QPushButton("Clear ACD")
         self.acd_clear_btn.clicked.connect(self._clear_acd)
-        ab.addWidget(self.acd_clear_btn)
-        ab.addStretch(1)
-        rv.addLayout(ab)
+        sb.addWidget(self.acd_clear_btn)
+        sb.addStretch(1)
+        rv.addLayout(sb)
 
-        # inspector: one checkable row per scene piece (model / ACD / hulls)
-        self.inspector = QtWidgets.QListWidget()
-        self.inspector.setMaximumHeight(140)
-        self.inspector.itemChanged.connect(self._on_inspector_toggle)
-        self.inspector.itemClicked.connect(self._on_inspector_clicked)
-        rv.addWidget(self.inspector)
-
-        self.hull_info = QtWidgets.QLabel("Select a model row to load it. Drag box handles to "
-                                          "resize, drag the body to move. Stack boxes for "
-                                          "concave shapes.")
+        self.hull_info = QtWidgets.QLabel("Select a model row to load it. Drag the gizmo "
+                                          "arrows/rings to move/rotate; use Transform for "
+                                          "exact values; Face mode reshapes single faces.")
         self.hull_info.setWordWrap(True)
         rv.addWidget(self.hull_info)
+        rh.addWidget(view, 1)
         split.addWidget(right)
-        split.setSizes([520, 660])
+        split.setSizes([460, 720])
 
     # ---- environment / process ----
     def _env(self):
@@ -853,7 +907,7 @@ class Main(QtWidgets.QMainWindow):
             if len(s["bounds"]) == 6:
                 self._spawn_box(self._to_vtk_bounds(s["bounds"]), s["type"],
                                 s["axis"], s["top_scale"], sides=s["sides"],
-                                rot=s["rot"])
+                                rot=s["rot"], verts=s["verts"], faces=s["faces"])
         if self.model_rows[modl].get("acd_parts"):
             self._show_acd(self.model_rows[modl]["acd_parts"])
         self._grid()
@@ -1018,32 +1072,58 @@ class Main(QtWidgets.QMainWindow):
     def _hull_spec(entry):
         """Normalize a stored hull (legacy 6-float list or shape dict)."""
         if isinstance(entry, dict):
-            return {"type": (entry.get("type") or "box").lower(),
-                    "bounds": [float(c) for c in entry.get("bounds", [])[:6]],
+            t = (entry.get("type") or "box").lower()
+            bounds = [float(c) for c in entry.get("bounds", [])[:6]]
+            verts = [[float(c) for c in v] for v in (entry.get("verts") or [])]
+            if t == "mesh" and verts and len(bounds) != 6:
+                xs, ys, zs = zip(*verts)          # mesh bounds derive from geometry
+                bounds = [min(xs), min(ys), min(zs), max(xs), max(ys), max(zs)]
+            return {"type": t,
+                    "bounds": bounds,
                     "axis": entry.get("axis", "+x"),
                     "top_scale": float(entry.get("top_scale", 0.5)),
                     "sides": int(entry.get("sides", 12)),
-                    "rot": [float(a) for a in entry.get("rot", (0, 0, 0))]}
+                    "rot": [float(a) for a in (list(entry.get("rot") or [])
+                                               + [0, 0, 0])[:3]],
+                    "verts": verts,
+                    "faces": [[int(i) for i in f] for f in (entry.get("faces") or [])]}
         return {"type": "box", "bounds": [float(c) for c in entry[:6]],
-                "axis": "+x", "top_scale": 0.5, "sides": 12, "rot": [0.0, 0.0, 0.0]}
+                "axis": "+x", "top_scale": 0.5, "sides": 12, "rot": [0.0, 0.0, 0.0],
+                "verts": [], "faces": []}
 
     def _spawn_box(self, vtk_bounds, shape="box", axis="+x", top_scale=0.5, sides=12,
-                   rot=(0, 0, 0)):
+                   rot=(0, 0, 0), verts=None, faces=None):
         if self.plotter is None:
             return
         entry = {"widget": None, "bounds": tuple(vtk_bounds), "type": shape, "axis": axis,
                  "top_scale": top_scale, "sides": sides,
                  "rot": [float(a) for a in (list(rot) + [0, 0, 0])[:3]],
                  "actor": None, "name": "hullprev_%d" % len(self.boxes)}
+        if shape == "mesh":
+            entry["verts"] = [list(v) for v in (verts or [])]
+            entry["faces"] = [list(f) for f in (faces or [])]
         self.boxes.append(entry)
         self._update_hull_preview(entry)
+
+    @staticmethod
+    def _entry_spec(entry):
+        """The hull_from_spec dict for an editor entry (mesh carries geometry)."""
+        spec = {"type": entry["type"], "axis": entry["axis"],
+                "top_scale": entry["top_scale"], "sides": entry.get("sides", 12),
+                "rot": entry.get("rot") or [0, 0, 0]}
+        if entry["type"] == "mesh":
+            spec["verts"] = entry.get("verts") or []
+            spec["faces"] = entry.get("faces") or []
+        else:
+            spec["bounds"] = Main._from_vtk_bounds(entry["bounds"])
+        return spec
 
     def _hull_part(self, spec):
         """hull_from_spec with rotation applied; if the model-side helper ignores
         the "rot" key (older build), rotate the verts locally instead."""
         rot = spec.get("rot") or [0, 0, 0]
         part = hull_from_spec(spec)
-        if part is None or not any(float(a) for a in rot):
+        if part is None or not any(float(a) for a in rot) or "bounds" not in spec:
             return part
         plain = hull_from_spec({k: v for k, v in spec.items() if k != "rot"})
         try:
@@ -1062,11 +1142,7 @@ class Main(QtWidgets.QMainWindow):
         included, since the affine gizmo attaches to this actor."""
         if self.plotter is None:
             return
-        part = self._hull_part({"type": entry["type"],
-                                "bounds": self._from_vtk_bounds(entry["bounds"]),
-                                "axis": entry["axis"], "top_scale": entry["top_scale"],
-                                "sides": entry.get("sides", 12),
-                                "rot": entry.get("rot") or [0, 0, 0]})
+        part = self._hull_part(self._entry_spec(entry))
         if part is None:                       # shape not buildable — drop stale actor
             try:
                 self.plotter.remove_actor(entry["name"])
@@ -1104,10 +1180,11 @@ class Main(QtWidgets.QMainWindow):
         if self.plotter is None:
             return
         self._detach_gizmo()
+        self._clear_face_sel()
         self._selected_hull = i if (i is not None and 0 <= i < len(self.boxes)) else None
         for e in self.boxes:                      # refresh highlight on every hull
             self._update_hull_preview(e)
-        if self._selected_hull is not None:
+        if self._selected_hull is not None and not self._face_mode:
             actor = self.boxes[self._selected_hull].get("actor")
             if actor is not None:
                 try:
@@ -1115,6 +1192,7 @@ class Main(QtWidgets.QMainWindow):
                         actor, release_callback=self._on_gizmo_release)
                 except Exception:
                     self._gizmo = None
+        self._load_transform_panel()
         try:
             self.plotter.render()
         except Exception:
@@ -1152,8 +1230,19 @@ class Main(QtWidgets.QMainWindow):
         t = r @ ctr + m[:3, 3] - ctr
         entry["bounds"] = (vb[0] + t[0], vb[1] + t[0], vb[2] + t[1],
                            vb[3] + t[1], vb[4] + t[2], vb[5] + t[2])
-        old = entry.get("rot") or [0, 0, 0]
-        entry["rot"] = _matrix_to_euler_deg(r @ _euler_deg_to_matrix(old))
+        if entry["type"] == "mesh":
+            # explicit geometry: bake translation + rotation straight into the verts
+            v = np.asarray(entry.get("verts") or [], dtype=float)
+            if len(v):
+                v = (v - ctr) @ r.T + ctr + t
+                entry["verts"] = [list(p) for p in v]
+                entry["bounds"] = (float(v[:, 0].min()), float(v[:, 0].max()),
+                                   float(v[:, 1].min()), float(v[:, 1].max()),
+                                   float(v[:, 2].min()), float(v[:, 2].max()))
+            entry["rot"] = [0.0, 0.0, 0.0]
+        else:
+            old = entry.get("rot") or [0, 0, 0]
+            entry["rot"] = _matrix_to_euler_deg(r @ _euler_deg_to_matrix(old))
         try:
             actor.user_matrix = np.eye(4)
         except Exception:
@@ -1161,6 +1250,204 @@ class Main(QtWidgets.QMainWindow):
         # rebuild actor + reattach gizmo, deferred so the widget isn't torn down
         # from inside its own VTK release observer
         QtCore.QTimer.singleShot(0, lambda: self._select_hull(i))
+
+    # ---- transform panel (numeric move / scale / rotation) ----
+    def _load_transform_panel(self):
+        """Reflect the selected hull into the Move/Scale/Rotation spinboxes."""
+        if not hasattr(self, "_xf"):
+            return
+        i = self._selected_hull
+        self._xf_loading = True
+        try:
+            if i is None or not (0 <= i < len(self.boxes)):
+                for triple in self._xf.values():
+                    for s in triple:
+                        s.setValue(0.0)
+                return
+            e = self.boxes[i]
+            vb = e["bounds"]
+            ctr = ((vb[0] + vb[1]) / 2, (vb[2] + vb[3]) / 2, (vb[4] + vb[5]) / 2)
+            size = (vb[1] - vb[0], vb[3] - vb[2], vb[5] - vb[4])
+            rot = e.get("rot") or [0, 0, 0]
+            for k, vals in (("pos", ctr), ("size", size), ("rot", rot)):
+                for s, v in zip(self._xf[k], vals):
+                    s.setValue(float(v))
+            mesh = e["type"] == "mesh"
+            for s in self._xf["rot"]:             # mesh rot is baked into verts
+                s.setEnabled(not mesh)
+        finally:
+            self._xf_loading = False
+
+    def _apply_transform_panel(self):
+        """Push spinbox values onto the selected hull (centre/size/rotation)."""
+        if self._xf_loading or self.plotter is None:
+            return
+        i = self._selected_hull
+        if i is None or not (0 <= i < len(self.boxes)):
+            return
+        e = self.boxes[i]
+        cx, cy, cz = (s.value() for s in self._xf["pos"])
+        sx, sy, sz = (max(0.1, s.value()) for s in self._xf["size"])
+        nb = (cx - sx / 2, cx + sx / 2, cy - sy / 2, cy + sy / 2,
+              cz - sz / 2, cz + sz / 2)
+        if e["type"] == "mesh":
+            v = np.asarray(e.get("verts") or [], dtype=float)
+            if len(v):
+                ob = e["bounds"]
+                octr = np.array([(ob[0] + ob[1]) / 2, (ob[2] + ob[3]) / 2,
+                                 (ob[4] + ob[5]) / 2])
+                osz = np.array([max(1e-6, ob[1] - ob[0]), max(1e-6, ob[3] - ob[2]),
+                                max(1e-6, ob[5] - ob[4])])
+                v = (v - octr) * (np.array([sx, sy, sz]) / osz) + np.array([cx, cy, cz])
+                e["verts"] = [list(p) for p in v]
+        else:
+            e["rot"] = [s.value() for s in self._xf["rot"]]
+        e["bounds"] = nb
+        self._update_hull_preview(e)
+        self._refresh_inspector()
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+
+    # ---- face mode (pick a face, push it along its normal or scale it) ----
+    def _toggle_face_mode(self, on):
+        self._face_mode = bool(on)
+        if self.plotter is None:
+            return
+        if on:
+            self._detach_gizmo()                  # picking and gizmo fight for clicks
+            try:
+                self.plotter.enable_element_picking(
+                    callback=self._on_face_pick, mode="cell", show_message=False,
+                    left_clicking=True, show=False)
+            except Exception as exc:
+                self._append("face picking unavailable: %r" % exc)
+                self.face_btn.setChecked(False)
+                return
+            self._append("Face mode: click a face on the selected hull.")
+        else:
+            try:
+                self.plotter.disable_picking()
+            except Exception:
+                pass
+            self._clear_face_sel()
+            if self._selected_hull is not None:   # bring the gizmo back
+                self._select_hull(self._selected_hull)
+
+    def _ensure_mesh_entry(self, e):
+        """Convert a parametric hull into explicit geometry so single faces can
+        move independently (a box stops being expressible as bounds+rot)."""
+        if e["type"] == "mesh":
+            return True
+        part = self._hull_part(self._entry_spec(e))
+        if part is None:
+            return False
+        e["verts"] = [list(v) for v in part[0]]
+        e["faces"] = [list(f) for f in part[1]]
+        e["type"] = "mesh"
+        e["rot"] = [0.0, 0.0, 0.0]                # rotation now baked into verts
+        return True
+
+    def _on_face_pick(self, element):
+        """A cell was clicked: find the selected hull's coplanar face containing it
+        (a logical box face = 2 coplanar triangles) and highlight it."""
+        i = self._selected_hull
+        if i is None or not (0 <= i < len(self.boxes)) or element is None:
+            return
+        e = self.boxes[i]
+        if e["type"] != "mesh":
+            self._push_undo()                     # conversion to mesh is undoable
+        if not self._ensure_mesh_entry(e):
+            return
+        try:
+            pts = np.asarray(element.points, dtype=float)[:3]
+        except Exception:
+            return
+        if len(pts) < 3:
+            return
+        n = np.cross(pts[1] - pts[0], pts[2] - pts[0])
+        ln = np.linalg.norm(n)
+        if ln < 1e-9:
+            return
+        n /= ln
+        d = float(n @ pts[0])
+        verts = np.asarray(e["verts"], dtype=float)
+        # the picked plane must belong to THIS hull (clicks on the model are ignored)
+        tol = 1e-3 * max(1.0, float(np.abs(verts).max()))
+        on_plane = np.abs(verts @ n - d) < tol
+        idx = [int(k) for k in np.nonzero(on_plane)[0]]
+        face_tris = [f for f in e["faces"] if all(on_plane[v] for v in f)]
+        if len(idx) < 3 or not face_tris:
+            self._append("Pick a face on the SELECTED hull (model faces don't count).")
+            return
+        self._face_sel = {"hull": i, "idx": idx, "normal": n.tolist()}
+        try:                                       # highlight the face
+            fpts = verts[idx]
+            cells = []
+            remap = {v: j for j, v in enumerate(idx)}
+            for f in face_tris:
+                cells.extend([3, remap[f[0]], remap[f[1]], remap[f[2]]])
+            self.plotter.add_mesh(pv.PolyData(fpts, np.asarray(cells, dtype=np.int64)),
+                                  color="#ffeb3b", opacity=0.9, name="face_sel")
+            self.plotter.render()
+        except Exception:
+            pass
+        self._append("Face selected: %d vert(s); use Move along normal / Scale face."
+                     % len(idx))
+
+    def _clear_face_sel(self):
+        self._face_sel = None
+        if self.plotter is not None:
+            try:
+                self.plotter.remove_actor("face_sel")
+            except Exception:
+                pass
+
+    def _apply_face_edit(self, transform):
+        """Shared plumbing for the face buttons: undo snapshot, edit the selected
+        face's verts, refresh geometry + bounds + highlight."""
+        fs = self._face_sel
+        if fs is None:
+            self._append("Face mode: select a face first.")
+            return
+        i = fs["hull"]
+        if not (0 <= i < len(self.boxes)) or self.boxes[i]["type"] != "mesh":
+            return
+        self._push_undo()
+        e = self.boxes[i]
+        v = np.asarray(e["verts"], dtype=float)
+        sel = np.asarray(fs["idx"], dtype=int)
+        v[sel] = transform(v[sel])
+        e["verts"] = [list(p) for p in v]
+        e["bounds"] = (float(v[:, 0].min()), float(v[:, 0].max()),
+                       float(v[:, 1].min()), float(v[:, 1].max()),
+                       float(v[:, 2].min()), float(v[:, 2].max()))
+        self._update_hull_preview(e)
+        self._clear_face_sel()                    # geometry moved; re-pick to continue
+        self._load_transform_panel()
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+
+    def _face_move(self):
+        fs = self._face_sel
+        if fs is None:
+            self._append("Face mode: select a face first.")
+            return
+        n = np.asarray(fs["normal"], dtype=float)
+        off = float(self.face_offset.value())
+        self._apply_face_edit(lambda pts: pts + n * off)
+
+    def _face_scale_apply(self):
+        fs = self._face_sel
+        if fs is None:
+            self._append("Face mode: select a face first.")
+            return
+        k = float(self.face_scale.value())
+        # scale about the face centroid: shrinking a box's top face = trapezium
+        self._apply_face_edit(lambda pts: pts.mean(axis=0) + (pts - pts.mean(axis=0)) * k)
 
     def _default_box_bounds(self):
         x0, y0, z0, x1, y1, z1 = getattr(self, "bb", (0, 0, 0, 64, 64, 64))
@@ -1227,10 +1514,11 @@ class Main(QtWidgets.QMainWindow):
             return
         sel = self._selected_hull
         specs = [(e["bounds"], e["type"], e["axis"], e["top_scale"], e.get("sides", 12),
-                  e.get("rot") or [0, 0, 0]) for e in self.boxes]
+                  e.get("rot") or [0, 0, 0], e.get("verts"), e.get("faces"))
+                 for e in self.boxes]
         self._clear_boxes()
-        for vb, t, ax, ts, sd, rot in specs:
-            self._spawn_box(vb, t, ax, ts, sides=sd, rot=rot)
+        for vb, t, ax, ts, sd, rot, mv, mf in specs:
+            self._spawn_box(vb, t, ax, ts, sides=sd, rot=rot, verts=mv, faces=mf)
         if sel is not None and 0 <= sel < len(self.boxes):
             self._select_hull(sel)
         self.plotter.render()
@@ -1246,7 +1534,9 @@ class Main(QtWidgets.QMainWindow):
                 if k in ("widget", "actor", "name"):
                     continue
                 if isinstance(v, (list, tuple)):
-                    d[k] = list(v)
+                    # deep copy: mesh verts are lists-of-lists and must not alias
+                    # the live entry, or editing would mutate past snapshots
+                    d[k] = json.loads(json.dumps(list(v)))
                 elif isinstance(v, (str, int, float, bool)):
                     d[k] = v
             snap.append(d)
@@ -1267,7 +1557,8 @@ class Main(QtWidgets.QMainWindow):
             if self.plotter is not None:
                 self._spawn_box(bounds, s.get("type", "box"), s.get("axis", "+x"),
                                 s.get("top_scale", 0.5), sides=s.get("sides", 12),
-                                rot=s.get("rot", (0, 0, 0)))
+                                rot=s.get("rot", (0, 0, 0)),
+                                verts=s.get("verts"), faces=s.get("faces"))
             else:
                 e = dict(s)
                 e["bounds"] = bounds
@@ -1325,7 +1616,12 @@ class Main(QtWidgets.QMainWindow):
                 else:
                     hulls.append(b)                # legacy compact form
                 continue
-            if e["type"] == "wedge":
+            if e["type"] == "mesh":
+                d = {"type": "mesh",
+                     "verts": [[round(float(c), 2) for c in v]
+                               for v in (e.get("verts") or [])],
+                     "faces": [[int(i) for i in f] for f in (e.get("faces") or [])]}
+            elif e["type"] == "wedge":
                 d = {"type": "wedge", "bounds": b, "axis": e["axis"]}
             elif e["type"] == "cylinder":
                 d = {"type": "cylinder", "bounds": b, "sides": int(e.get("sides", 12))}

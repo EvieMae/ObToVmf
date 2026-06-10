@@ -142,3 +142,22 @@ def test_hull_from_spec_cylinder_plane_and_rot():
     # junk specs still -> None
     assert hull_from_spec({"type": "cylinder", "bounds": [1, 2]}) is None
     assert hull_from_spec([1, 2, 3]) is None
+
+
+def test_mesh_hull_spec_roundtrip(tmp_path):
+    # the face-edit mode stores explicit geometry as {"type":"mesh"} — the build
+    # writes it verbatim as one convex piece
+    from oblivion2vmf.model import hull_from_spec, box_hull, write_collision_smd
+    verts, faces = box_hull((0.0, 0.0, 0.0, 10.0, 10.0, 10.0))
+    spec = {"type": "mesh", "verts": [list(v) for v in verts],
+            "faces": [list(f) for f in faces]}
+    part = hull_from_spec(spec)
+    assert part is not None and len(part[0]) == 8 and len(part[1]) == 12
+    # rot rotates about the verts' own bbox centre
+    spun = hull_from_spec({**spec, "rot": [0, 0, 90]})
+    assert abs(spun[0][0][0] - 10.0) < 1e-6      # (0,0,0) -> (10,0,0) about (5,5,5)
+    # malformed specs refused
+    assert hull_from_spec({"type": "mesh", "verts": [[0, 0, 0]], "faces": []}) is None
+    out = tmp_path / "m.smd"
+    write_collision_smd([part], str(out), scale=1.0)
+    assert out.read_text().count("\nphys\n") == 12
