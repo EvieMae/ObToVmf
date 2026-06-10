@@ -1205,20 +1205,42 @@ class Main(QtWidgets.QMainWindow):
     _ACD_COLORS = ["#ff7043", "#ffca28", "#9ccc65", "#26c6da", "#ab47bc",
                    "#ec407a", "#7e57c2", "#5c6bc0", "#66bb6a", "#ffa726"]
 
+    @staticmethod
+    def _hex_rgb(h):
+        h = h.lstrip("#")
+        return [int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)]
+
     def _show_acd(self, parts):
+        """Draw all convex pieces as ONE actor, coloured per-piece via cell scalars.
+        A separate actor per piece crashed VTK on big interiors (hundreds/thousands
+        of pieces); one merged mesh is stable regardless of count."""
         self._clear_acd_actors()
         self.acd_actors = []
+        if self.plotter is None or not parts:
+            return
+        palette = np.array([self._hex_rgb(c) for c in self._ACD_COLORS], dtype=np.uint8)
+        all_pts, all_faces, cell_rgb, off = [], [], [], 0
         for i, (pv_, pf) in enumerate(parts):
-            try:
-                pts = np.array(pv_, dtype=float)
-                faces = np.hstack([[3, *f] for f in pf]).astype(np.int64)
-                mesh = pv.PolyData(pts, faces)
-                a = self.plotter.add_mesh(mesh, color=self._ACD_COLORS[i % len(self._ACD_COLORS)],
-                                          opacity=0.45, show_edges=True, edge_color="#0b1b3a",
-                                          name="acd_%d" % i)
-                self.acd_actors.append("acd_%d" % i)
-            except Exception:
-                pass
+            v = np.asarray(pv_, dtype=float)
+            if len(v) < 3 or not pf:
+                continue
+            all_pts.append(v)
+            col = palette[i % len(palette)]
+            for f in pf:
+                all_faces.append((3, f[0] + off, f[1] + off, f[2] + off))
+                cell_rgb.append(col)
+            off += len(v)
+        if not all_faces:
+            return
+        try:
+            mesh = pv.PolyData(np.vstack(all_pts),
+                               np.asarray(all_faces, dtype=np.int64).ravel())
+            mesh.cell_data["rgb"] = np.asarray(cell_rgb, dtype=np.uint8)
+            self.plotter.add_mesh(mesh, scalars="rgb", rgb=True, opacity=0.5,
+                                  show_edges=True, edge_color="#0b1b3a", name="acd_0")
+            self.acd_actors = ["acd_0"]
+        except Exception as e:
+            self._append("(could not draw ACD preview: %r)" % e)
 
     def _clear_acd_actors(self):
         for name in getattr(self, "acd_actors", []):
@@ -2258,8 +2280,13 @@ class Main(QtWidgets.QMainWindow):
         if row is None:
             self._append("Model %s is not in the table; re-scan." % modl)
             return
-        self._append("Havok exact collision for %s: %d convex piece(s) from coplanar "
-                     "faces. Save overrides to keep them." % (os.path.basename(modl), len(parts)))
+        msg = ("Havok exact collision for %s: %d convex piece(s) from coplanar faces. "
+               "Save overrides to keep them." % (os.path.basename(modl), len(parts)))
+        if len(parts) > 256:
+            msg += (" [warning] that's a lot of pieces — this mesh is curved/detailed, "
+                    "not flat-walled, so exact mode isn't ideal here. Prefer 'Generate "
+                    "ACD' (CoACD) for fewer, cleaner hulls.")
+        self._append(msg)
         if modl == self.cur_model and self.plotter is not None:
             self.cur_model = None
             self._load_model_3d(modl)
