@@ -174,8 +174,9 @@ class Main(QtWidgets.QMainWindow):
         self._gizmo = None          # the single affine-transform widget
         self._face_sel = None       # {"idx": [vert indices], "normal": np3} in face mode
         self._face_mode = False
-        self._tool_mode = "gizmo"   # "camera" | "gizmo" | "faces" (floating dock)
+        self._tool_mode = "gizmo"   # "camera"|"gizmo"|"scale"|"faces" (floating dock)
         self._tool_dock = None
+        self._scale_widget = None   # box widget for the Scale tool
         self._xf_loading = False    # guard: transform panel being populated
         self.acd_actors = []       # named actors of the current ACD preview
         self.cur_model = None      # nif currently loaded in the 3D view
@@ -435,6 +436,11 @@ class Main(QtWidgets.QMainWindow):
             top.addWidget(b)
         lv.addLayout(top)
 
+        self.hide_set = QtWidgets.QCheckBox("Hide models whose collision isn't (global)")
+        self.hide_set.setChecked(bool(self.cfg.get("hide_set", False)))
+        self.hide_set.toggled.connect(self._apply_table_filter)
+        lv.addWidget(self.hide_set)
+
         oh = QtWidgets.QHBoxLayout()
         oh.addWidget(QtWidgets.QLabel("Overrides JSON"))
         self.ov_path = QtWidgets.QLineEdit(str(self.cfg.get("model_overrides", "")))
@@ -527,6 +533,7 @@ class Main(QtWidgets.QMainWindow):
                 rv.addWidget(self.plotter.interactor, 1)
                 self._style_viewport()
                 self._apply_camera_style()
+                self._install_camera_guard()
                 self._build_tool_dock()
             except Exception as e:                       # missing/old GL drivers, etc.
                 rv.addWidget(QtWidgets.QLabel(
@@ -821,6 +828,7 @@ class Main(QtWidgets.QMainWindow):
                            "(custom)", "none"])
             saved_coll = ov.get("collision") or "(global)"
             coll.setCurrentText("(custom)" if saved_coll == "custom" else saved_coll)
+            coll.currentTextChanged.connect(self._apply_table_filter)
             self.table.setCellWidget(i, 1, coll)
             ramp = QtWidgets.QComboBox()
             ramp.addItems(["+x", "-x", "+y", "-y"])
@@ -840,6 +848,17 @@ class Main(QtWidgets.QMainWindow):
         self._append("Loaded %d models (%s; %d with saved overrides)."
                      % (len(models), source,
                         sum(1 for k in self.model_rows if k.lower() in saved)))
+        self._apply_table_filter()
+
+    def _apply_table_filter(self, *_):
+        """When 'Hide … isn't (global)' is on, hide every row whose collision combo
+        is set to something other than (global) — i.e. show only the models you
+        haven't configured yet."""
+        hide = getattr(self, "hide_set", None) is not None and self.hide_set.isChecked()
+        for r in range(self.table.rowCount()):
+            w = self.table.cellWidget(r, 1)
+            coll = w.currentText() if w is not None else "(global)"
+            self.table.setRowHidden(r, hide and coll != "(global)")
 
     def _selected_model(self):
         it = self.table.item(self.table.currentRow(), 0)
@@ -1057,13 +1076,29 @@ class Main(QtWidgets.QMainWindow):
 
     def _apply_camera_style(self):
         """Terrain interaction: the camera orbits in exactly TWO degrees of freedom
-        (azimuth + elevation) and can never roll. VTK's picking enable/disable swaps
-        the interactor style back to the free trackball, so this is re-applied after
-        every picking change, not just at startup."""
+        (azimuth + elevation) and can never roll."""
         if self.plotter is None:
             return
         try:
             self.plotter.enable_terrain_style(mouse_wheel_zooms=True, shift_pans=True)
+        except Exception:
+            pass
+
+    def _install_camera_guard(self):
+        """Hard guarantee against a trackball/rolling camera: on every interaction
+        start, if anything (a widget, a VTK default) has swapped the interactor style
+        away from terrain, snap it straight back. Fires before the drag is processed,
+        so a free-tumble can never actually happen."""
+        try:
+            self.plotter.iren.add_observer("StartInteractionEvent", self._camera_guard)
+        except Exception:
+            pass
+
+    def _camera_guard(self, *_):
+        try:
+            cur = self.plotter.iren.interactor.GetInteractorStyle()
+            if cur is None or "Terrain" not in cur.GetClassName():
+                self._apply_camera_style()
         except Exception:
             pass
 
@@ -1100,6 +1135,8 @@ class Main(QtWidgets.QMainWindow):
         mode_btn("\U0001f590", "Camera only — orbit/pan/zoom, no gizmo", "camera")
         mode_btn("✥", "Move / Rotate — gizmo on the selected hull "
                            "(hold Shift on rings to snap 45°)", "gizmo").setChecked(True)
+        mode_btn("⛶", "Scale — drag the box-cage faces to resize the hull",
+                 "scale")
         mode_btn("▦", "Face mode — click a face, gizmo moves/tilts it", "faces")
 
         sepa = QtWidgets.QFrame(dock)
@@ -1139,20 +1176,25 @@ class Main(QtWidgets.QMainWindow):
         toggle; 'camera' detaches everything so clicks only drive the camera."""
         self._tool_mode = mode
         if mode == "faces":
+            self._detach_scale_widget()
             if not self.face_btn.isChecked():
                 self.face_btn.setChecked(True)     # triggers _toggle_face_mode(True)
             return
         if self.face_btn.isChecked():
             self.face_btn.setChecked(False)        # leaves face mode first
-        if mode == "camera":
-            self._detach_gizmo()
-            if self.plotter is not None:
-                try:
-                    self.plotter.render()
-                except Exception:
-                    pass
-        elif self._selected_hull is not None:      # gizmo mode: reattach
+        self._detach_gizmo()
+        self._detach_scale_widget()
+        if mode == "scale":
+            if self._selected_hull is not None:
+                self._attach_scale_widget(self._selected_hull)
+        elif mode == "gizmo" and self._selected_hull is not None:
             self._select_hull(self._selected_hull)
+        self._apply_camera_style()                 # NEVER leave a trackball style on
+        if self.plotter is not None:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
 
     def _snap_view(self, which):
         if self.plotter is None:
@@ -1272,11 +1314,65 @@ class Main(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    def _detach_scale_widget(self):
+        """Remove the Scale tool's box cage."""
+        self._scale_widget = None
+        if self.plotter is not None:
+            try:
+                self.plotter.clear_box_widgets()
+            except Exception:
+                pass
+
+    def _attach_scale_widget(self, i):
+        """Scale tool: a box cage whose face handles resize the hull (drag a face to
+        push it, drag the body to move). Reuses add_box_widget — no rotation."""
+        if self.plotter is None or not (0 <= i < len(self.boxes)):
+            return
+        self._detach_scale_widget()
+        vb = self.boxes[i]["bounds"]
+
+        def cb(box, widget):
+            self._on_scale_box(i, tuple(box.bounds))
+        try:
+            self._scale_widget = self.plotter.add_box_widget(
+                cb, bounds=vb, rotation_enabled=False, pass_widget=True,
+                color="#46c0ff")
+        except Exception:
+            self._scale_widget = None
+        self._apply_camera_style()                 # box widget must not steal the style
+
+    def _on_scale_box(self, i, nb):
+        """Box cage moved/resized: rewrite the hull bounds (parametric) or rescale
+        the verts from the old bbox to the new one (mesh)."""
+        if not (0 <= i < len(self.boxes)):
+            return
+        e = self.boxes[i]
+        ob = e["bounds"]
+        if tuple(ob) == tuple(nb):
+            return
+        self._push_undo()
+        if e["type"] == "mesh" and e.get("verts"):
+            v = np.asarray(e["verts"], dtype=float)
+            octr = np.array([(ob[0] + ob[1]) / 2, (ob[2] + ob[3]) / 2,
+                             (ob[4] + ob[5]) / 2])
+            osz = np.array([max(1e-6, ob[1] - ob[0]), max(1e-6, ob[3] - ob[2]),
+                            max(1e-6, ob[5] - ob[4])])
+            nctr = np.array([(nb[0] + nb[1]) / 2, (nb[2] + nb[3]) / 2,
+                             (nb[4] + nb[5]) / 2])
+            nsz = np.array([nb[1] - nb[0], nb[3] - nb[2], nb[5] - nb[4]])
+            v = (v - octr) * (nsz / osz) + nctr
+            e["verts"] = [list(p) for p in v]
+        e["bounds"] = tuple(nb)
+        self._update_hull_preview(e)
+        self._load_transform_panel()
+        self._refresh_inspector()
+
     def _select_hull(self, i):
         """Make hull i current: highlight it and attach the Blender-style gizmo."""
         if self.plotter is None:
             return
         self._detach_gizmo()
+        self._detach_scale_widget()
         self._clear_face_sel()
         self._selected_hull = i if (i is not None and 0 <= i < len(self.boxes)) else None
         for e in self.boxes:                      # refresh highlight on every hull
@@ -1289,7 +1385,10 @@ class Main(QtWidgets.QMainWindow):
                         actor, release_callback=self._on_gizmo_release)
                 except Exception:
                     self._gizmo = None
+        elif self._selected_hull is not None and self._tool_mode == "scale":
+            self._attach_scale_widget(self._selected_hull)
         self._load_transform_panel()
+        self._apply_camera_style()                 # NEVER leave a trackball style on
         try:
             self.plotter.render()
         except Exception:
@@ -1423,26 +1522,75 @@ class Main(QtWidgets.QMainWindow):
         if self.plotter is None:
             return
         if on:
-            self._detach_gizmo()                  # picking and gizmo fight for clicks
-            try:
-                self.plotter.enable_element_picking(
-                    callback=self._on_face_pick, mode="cell", show_message=False,
-                    left_clicking=True, show=False)
-            except Exception as exc:
-                self._append("face picking unavailable: %r" % exc)
-                self.face_btn.setChecked(False)
-                return
-            self._apply_camera_style()            # picking resets the interactor style
+            self._detach_gizmo()
+            self._detach_scale_widget()
+            # IMPORTANT: we do NOT use pyvista's enable_*_picking — it swaps the
+            # interactor to a trackball-derived picking style. Instead we keep the
+            # terrain camera and pick faces ourselves with a vtkCellPicker on a
+            # left CLICK (a press+release that didn't drag = orbit).
+            self._install_face_picker()
             self._append("Face mode: click a face on the selected hull.")
         else:
-            try:
-                self.plotter.disable_picking()
-            except Exception:
-                pass
-            self._apply_camera_style()            # ditto on the way out
+            self._remove_face_picker()
             self._clear_face_sel()
             if self._selected_hull is not None:   # bring the gizmo back
                 self._select_hull(self._selected_hull)
+        self._apply_camera_style()                # terrain style stays, always
+
+    def _install_face_picker(self):
+        """Left press/release observers that pick a face only on a true click."""
+        self._remove_face_picker()
+        try:
+            iren = self.plotter.iren
+            self._pick_press = None
+            self._pick_obs = [
+                iren.add_observer("LeftButtonPressEvent", self._face_press),
+                iren.add_observer("LeftButtonReleaseEvent", self._face_release)]
+        except Exception as exc:
+            self._append("face picking unavailable: %r" % exc)
+            self.face_btn.setChecked(False)
+
+    def _remove_face_picker(self):
+        obs = getattr(self, "_pick_obs", None)
+        if not obs:
+            return
+        try:
+            for o in obs:
+                self.plotter.iren.remove_observer(o)
+        except Exception:
+            pass
+        self._pick_obs = None
+
+    def _face_press(self, *_):
+        try:
+            self._pick_press = self.plotter.iren.interactor.GetEventPosition()
+        except Exception:
+            self._pick_press = None
+
+    def _face_release(self, *_):
+        if not self._face_mode:
+            return
+        try:
+            x, y = self.plotter.iren.interactor.GetEventPosition()
+        except Exception:
+            return
+        p = self._pick_press
+        self._pick_press = None
+        if p is None or (abs(x - p[0]) + abs(y - p[1])) > 4:
+            return                                # it was a drag (orbit), not a click
+        try:
+            import vtk
+            picker = vtk.vtkCellPicker()
+            picker.SetTolerance(0.005)
+            picker.Pick(x, y, 0, self.plotter.renderer)
+            cid = picker.GetCellId()
+            if cid < 0:
+                return
+            cell = picker.GetDataSet().GetCell(cid)
+            pts = np.array([cell.GetPoints().GetPoint(k) for k in range(3)])
+        except Exception:
+            return
+        self._on_face_pick(pts)
 
     def _ensure_mesh_entry(self, e):
         """Convert a parametric hull into explicit geometry so single faces can
@@ -1458,21 +1606,18 @@ class Main(QtWidgets.QMainWindow):
         e["rot"] = [0.0, 0.0, 0.0]                # rotation now baked into verts
         return True
 
-    def _on_face_pick(self, element):
-        """A cell was clicked: find the selected hull's coplanar face containing it
-        (a logical box face = 2 coplanar triangles) and highlight it."""
+    def _on_face_pick(self, pts):
+        """A triangle was clicked (3 world points): find the selected hull's coplanar
+        face containing it (a logical box face = several coplanar triangles)."""
         i = self._selected_hull
-        if i is None or not (0 <= i < len(self.boxes)) or element is None:
+        if i is None or not (0 <= i < len(self.boxes)) or pts is None:
             return
         e = self.boxes[i]
         if e["type"] != "mesh":
             self._push_undo()                     # conversion to mesh is undoable
         if not self._ensure_mesh_entry(e):
             return
-        try:
-            pts = np.asarray(element.points, dtype=float)[:3]
-        except Exception:
-            return
+        pts = np.asarray(pts, dtype=float)[:3]
         if len(pts) < 3:
             return
         n = np.cross(pts[1] - pts[0], pts[2] - pts[0])
@@ -1521,6 +1666,7 @@ class Main(QtWidgets.QMainWindow):
             self._gizmo = self.plotter.add_affine_transform_widget(
                 actor, release_callback=self._on_face_gizmo_release)
             fs["actor"] = actor
+            self._apply_camera_style()             # widget must not steal the style
             self.plotter.render()
         except Exception:
             pass
@@ -1660,6 +1806,7 @@ class Main(QtWidgets.QMainWindow):
 
     def _clear_boxes(self):
         self._detach_gizmo()
+        self._scale_widget = None
         if _HAVE_3D and self.plotter is not None:
             try:
                 self.plotter.clear_box_widgets()
@@ -1871,6 +2018,7 @@ class Main(QtWidgets.QMainWindow):
         self.cfg["instance_host"] = self.instance_host.text()
         self.cfg["model_src"] = self.model_src.currentText()
         self.cfg["model_filter"] = self.model_filter.text()
+        self.cfg["hide_set"] = self.hide_set.isChecked()
         self.cfg["model_overrides"] = self.ov_path.text()
         self.cfg["tree_map"] = self._tree_map()
         _save(self.cfg)
