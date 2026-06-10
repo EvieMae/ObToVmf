@@ -99,8 +99,9 @@ ACD_MAX_CONCURRENCY = 6
 # 6 = LOD switch thresholds 3/10/15/20; 7 = distance-based thresholds, gentle near;
 # 8 = weld + pyfqmr preserve_border; 9 = sooner switch distances;
 # 10 = LOD distances scale with model size; 11 = reproject LOD normals;
-# 12 = cap LOD count for big/multi-material models (GMod studiomdl LOD0 corruption).
-GEOM_REV = 12
+# 12 = cap LOD count for big/multi-material models (GMod studiomdl LOD0 corruption);
+# 13 = split models over the 32768-vert mesh-batch limit into multiple $body SMDs.
+GEOM_REV = 13
 ACD_TIMEOUT = 50            # seconds before a CoACD attempt is abandoned
 ACD_COARSE_THRESHOLD = 0.4  # fast retry threshold for meshes too slow at the fine one
 # Convert a desired LOD switch distance (Hammer units) to studiomdl's $lod screen
@@ -345,6 +346,71 @@ def coplanar_convex_pieces(subs, thickness=4.0, normal_tol=0.999, dist_tol=0.5,
     return parts[:max_pieces] if len(parts) > max_pieces else parts
 
 
+# Source caps a single mesh batch (one material, one body) at this many verts
+# (the dynamic vertex buffer). Split geometry so no body's mesh exceeds it.
+MAX_MESH_VERTS = 30000
+
+
+def _split_submesh_by_verts(sub, max_verts):
+    """Split one submesh's triangles into chunks each referencing <= max_verts
+    unique verts, remapping indices so each chunk is standalone. Lossless."""
+    verts = sub["verts"]
+    uvs = sub.get("uvs") or []
+    norms = sub.get("normals") or []
+    mat = sub.get("material")
+    chunks = []
+    cur_tris, remap, cv, cuv, cn = [], {}, [], [], []
+
+    def flush():
+        if cur_tris:
+            chunks.append({"verts": cv[:], "tris": cur_tris[:], "uvs": cuv[:],
+                           "normals": cn[:], "material": mat})
+
+    for tri in sub["tris"]:
+        # how many NEW verts this triangle would add to the current chunk
+        new = sum(1 for vi in tri if vi not in remap)
+        if cur_tris and len(cv) + new > max_verts:
+            flush()
+            cur_tris, remap, cv, cuv, cn = [], {}, [], [], []
+        nt = []
+        for vi in tri:
+            j = remap.get(vi)
+            if j is None:
+                j = remap[vi] = len(cv)
+                cv.append(verts[vi])
+                cuv.append(uvs[vi] if vi < len(uvs) else (0.0, 0.0))
+                cn.append(norms[vi] if vi < len(norms) else (0.0, 0.0, 1.0))
+            nt.append(j)
+        cur_tris.append(tuple(nt))
+    flush()
+    return chunks
+
+
+def split_bodies(subs, max_verts=MAX_MESH_VERTS):
+    """Partition submeshes into BODIES so each body's per-material mesh stays under
+    Source's vertex-buffer limit. Oversized single submeshes are split first; then
+    submeshes are packed into bodies keeping each body's vert total under the cap.
+    Returns a list of bodies (each a list of submeshes). Preserves geometry exactly
+    (no decimation), so the prop looks identical — it's just drawn in more batches."""
+    units = []
+    for s in subs:
+        if len(s["verts"]) > max_verts:
+            units.extend(_split_submesh_by_verts(s, max_verts))
+        else:
+            units.append(s)
+    bodies, cur, cur_v = [], [], 0
+    for u in units:
+        nv = len(u["verts"])
+        if cur and cur_v + nv > max_verts:
+            bodies.append(cur)
+            cur, cur_v = [], 0
+        cur.append(u)
+        cur_v += nv
+    if cur:
+        bodies.append(cur)
+    return bodies or [[]]
+
+
 def collision_vert_count(subs):
     return sum(len(s["verts"]) for s in (subs or []))
 
@@ -552,17 +618,26 @@ def hull_from_spec(spec):
 
 def write_qc(path, modelname, ref_smd, surfaceprop="default", scale=1.0,
              cdmaterials="models/" + MODEL_PREFIX, collision_smd=None, max_convex=64,
-             lods=None):
+             lods=None, bodies=None):
     ref = os.path.basename(ref_smd)
+    # bodies: list of SMD basenames for a model split across Source's per-mesh
+    # vertex-buffer limit. Each is its own $body (separate draw batches); the
+    # geometry is identical, just chunked. LODs are skipped when split.
+    refs = [os.path.basename(b) for b in (bodies or [ref_smd])]
     lines = [
         '$modelname "%s"' % modelname,
         "$staticprop",
         "$scale %s" % _num(scale),       # MUST precede $body -- studiomdl applies
-        '$body "body" "%s"' % ref,        # $scale only to bodies declared after it
+    ]
+    for i, r in enumerate(refs):          # $scale only to bodies declared after it
+        lines.append('$body "body%d" "%s"' % (i, r))
+    lines += [
         '$cdmaterials "%s"' % cdmaterials,
         '$surfaceprop "%s"' % surfaceprop,
-        '$sequence "idle" "%s" fps 1' % ref,
+        '$sequence "idle" "%s" fps 1' % refs[0],
     ]
+    if bodies and len(bodies) > 1:
+        lods = None                       # replacemodel per body is fiddly; skip
     # LOD stages: (switch_threshold, lod_smd_path). studiomdl swaps the body for
     # the lower-poly mesh past the threshold -> far foliage costs far fewer polys.
     for thresh, lod_smd in (lods or []):
@@ -1288,10 +1363,28 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 return res
             ref_smd = os.path.join(work_dir, slug + ".smd")
             qc = os.path.join(work_dir, slug + ".qc")
-            write_smd(subs, ref_smd, scale=m_scale,
-                      flip_winding=flip_winding, flip_v=flip_v)
-            lods = (_model_lods(subs, slug, work_dir, m_scale, flip_winding, flip_v)
-                    if model_lods else [])
+            # Source caps a mesh batch at 32768 verts — split big models (e.g. whole
+            # interiors) across multiple $body SMDs so each batch stays under it.
+            # Lossless: same geometry, just more draw batches.
+            body_units = split_bodies(subs, MAX_MESH_VERTS)
+            body_smds = None
+            if len(body_units) > 1:
+                body_smds = []
+                for bi, bsubs in enumerate(body_units):
+                    bsmd = os.path.join(work_dir, "%s_b%d.smd" % (slug, bi))
+                    write_smd(bsubs, bsmd, scale=m_scale,
+                              flip_winding=flip_winding, flip_v=flip_v)
+                    body_smds.append(bsmd)
+                write_smd(subs, ref_smd, scale=m_scale,    # still write the combined
+                          flip_winding=flip_winding, flip_v=flip_v)  # ref for LOD calc
+                res["logs"].append("    split %s -> %d bodies (>32768-vert batch limit)"
+                                   % (slug, len(body_units)))
+                lods = []                              # LODs skipped for split models
+            else:
+                write_smd(subs, ref_smd, scale=m_scale,
+                          flip_winding=flip_winding, flip_v=flip_v)
+                lods = (_model_lods(subs, slug, work_dir, m_scale, flip_winding, flip_v)
+                        if model_lods else [])
 
             # Collision source: the NIF's own Havok shell (clean structural mesh)
             # if present, else the render mesh.
@@ -1383,7 +1476,8 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 write_smd(coll_subs, phys, scale=m_scale)
                 coll_smd = phys
             write_qc(qc, "%s/%s.mdl" % (prefix, slug), ref_smd, scale=1.0,
-                     surfaceprop=m_surf, collision_smd=coll_smd, max_convex=maxc, lods=lods)
+                     surfaceprop=m_surf, collision_smd=coll_smd, max_convex=maxc,
+                     lods=lods, bodies=body_smds)
             if compile_models:
                 ok, clog = run_studiomdl(studiomdl, gamedir, qc)
                 if not ok:

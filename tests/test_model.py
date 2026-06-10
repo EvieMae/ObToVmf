@@ -193,3 +193,32 @@ def test_load_json_tolerant_salvages_truncated_cache(tmp_path):
     assert load_json_tolerant(str(tmp_path / "missing.json")) == {}
     (tmp_path / "junk.json").write_text("not json at all {{{")
     assert load_json_tolerant(str(tmp_path / "junk.json")) == {}
+
+
+def test_split_bodies_under_vertex_limit():
+    from oblivion2vmf.model import split_bodies, _split_submesh_by_verts
+    # one submesh with 90 verts (30 tris), cap 40 -> must split into chunks < 40 verts
+    verts = [[float(i), 0.0, 0.0] for i in range(90)]
+    tris = [[i, i + 1, i + 2] for i in range(0, 90, 3)]
+    sub = {"verts": verts, "tris": tris, "uvs": [], "normals": [], "material": "m"}
+    bodies = split_bodies([sub], max_verts=40)
+    assert len(bodies) >= 3
+    for body in bodies:
+        for s in body:
+            assert len(s["verts"]) <= 40
+    # geometry conserved: total triangles unchanged across the split
+    assert sum(len(s["tris"]) for b in bodies for s in b) == 30
+    # a small mesh stays a single body
+    small = {"verts": verts[:9], "tris": tris[:3], "uvs": [], "normals": [], "material": "m"}
+    assert len(split_bodies([small], max_verts=40)) == 1
+
+
+def test_write_qc_multi_body(tmp_path):
+    from oblivion2vmf.model import write_qc
+    qc = tmp_path / "m.qc"
+    bodies = [str(tmp_path / "m_b0.smd"), str(tmp_path / "m_b1.smd"),
+              str(tmp_path / "m_b2.smd")]
+    write_qc(str(qc), "oblivion2vmf/m.mdl", str(tmp_path / "m.smd"), bodies=bodies)
+    txt = qc.read_text()
+    assert txt.count("$body") == 3
+    assert '$body "body0" "m_b0.smd"' in txt and '$body "body2" "m_b2.smd"' in txt
