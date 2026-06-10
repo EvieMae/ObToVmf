@@ -97,6 +97,17 @@ def build_parser():
                      help="convert ONE interior cell (room) to a VMF: a sealed room shell "
                           "+ its placed objects as props + lights from placed LIGH refs. "
                           "Use --list-interiors to find the EDID. Needs --bsa/--data-dir.")
+    p.add_argument("--skybox-room", action="store_true",
+                   help="(interiors) wrap the room in tools/toolsskybox instead of the "
+                        "default sealed tools/toolsblack, so the enclosure renders the 2D "
+                        "sky on every face (for open-air courtyard cells).")
+    p.add_argument("--instance-into", metavar="HOST.vmf",
+                   help="(interiors) after writing the room, add it to this host .vmf as a "
+                        "func_instance (relative file path), auto-placed in a free spot "
+                        "beside the host's existing geometry. The host is created if absent.")
+    p.add_argument("--instance-origin", metavar="X,Y,Z",
+                   help="(interiors) explicit origin for --instance-into instead of "
+                        "auto-placement, in Hammer units, e.g. 0,0,0")
 
     p.add_argument("--out", default="terrain.vmf", help="output .vmf path (default: terrain.vmf)")
     p.add_argument("--scale", type=float, default=REAL_WORLD_SCALE,
@@ -212,11 +223,18 @@ def build_parser():
     mg.add_argument("--gamedir", help="GMod garrysmod dir with gameinfo.txt (else auto-detect)")
     mg.add_argument("--skip-compile", action="store_true",
                     help="write .smd/.qc but don't run studiomdl")
-    mg.add_argument("--collision", choices=["auto", "acd", "full", "none"], default="auto",
+    mg.add_argument("--collision",
+                    choices=["auto", "acd", "full", "bbox", "ramp", "none"], default="auto",
                     help="prop collision: 'auto' (solid small props, big buildings "
                          "non-solid so you pass through), 'acd' (ACCURATE walk-in "
                          "collision for buildings via convex decomposition, needs "
-                         "`pip install coacd`), 'full' (all solid), 'none'. Requires recompile.")
+                         "`pip install coacd`), 'full' (all solid, per-triangle), "
+                         "'bbox' (one box hull around each prop -- cheap blocker), "
+                         "'ramp' (one wedge hull rising z0->z1 along --ramp-axis, so "
+                         "you walk UP the slope), 'none'. Requires recompile.")
+    mg.add_argument("--ramp-axis", choices=["+x", "-x", "+y", "-y"], default="+x",
+                    help="for --collision ramp: model-local direction the wedge rises "
+                         "(default +x). Rotate the prop in-world to aim it.")
     mg.add_argument("--collision-size", type=float, default=400.0,
                     help="props wider than this (HU) count as 'big' for auto/acd (default 400)")
     mg.add_argument("--acd-threshold", type=float, default=0.08,
@@ -229,6 +247,18 @@ def build_parser():
                     help="max concurrent CoACD decompositions (each an isolated "
                          "subprocess; 0 = auto min(jobs, 6)). Raise it (e.g. 24) on a "
                          "many-core machine to speed up the collision phase")
+    mg.add_argument("--model-overrides", metavar="FILE.json",
+                    help="JSON of PER-MODEL build settings keyed by .nif path "
+                         "(lowercased), e.g. {\"architecture/anvil/house01.nif\": "
+                         "{\"collision\":\"ramp\",\"ramp_axis\":\"+x\",\"scale\":1.0,"
+                         "\"surfaceprop\":\"wood\",\"skip\":false}}. Overrides the global "
+                         "--collision/--ramp-axis/--scale for that mesh; 'skip' drops it. "
+                         "Edit this in the GUI 'Model edits' tab. Use --list-models to "
+                         "enumerate the meshes in your selection.")
+    mg.add_argument("--list-models", nargs="?", const="", metavar="FILTER",
+                    help="list the unique .nif meshes placed in the current selection "
+                         "(--cells/--region or --interior), optionally filtered by "
+                         "substring, then exit. Feeds the model editor.")
     mg.add_argument("--no-model-lods", dest="model_lods", action="store_false",
                     help="don't generate decimated $lod stages for props. By default "
                          "props over ~200 tris get 2 LODs (vertex-clustering decimation) "
@@ -298,6 +328,8 @@ def main(argv=None):
     # --- interiors (rooms) -------------------------------------------------
     if args.list_interiors is not None:
         return _list_interiors(args, esm)
+    if args.list_models is not None:
+        return _list_models(args, esm, ws)
     if args.interior:
         return _build_interior(args, esm)
 
@@ -514,6 +546,7 @@ def _rebuild_cache(args, ws, bounds, esm):
         flip_winding=args.flip_winding, flip_v=args.flip_v,
         collision=args.collision, collision_size=args.collision_size,
         acd_threshold=args.acd_threshold, acd_max_hulls=args.acd_max_hulls,
+        ramp_axis=args.ramp_axis, model_overrides=_load_model_overrides(args.model_overrides),
         trees=False, jobs=(args.jobs or None), use_cache=True, cache_rebuild=True)
     print("Cache rebuilt -> %s" % os.path.join(work_dir, ".build_cache.json"))
     return 0
@@ -682,6 +715,61 @@ def _list_interiors(args, esm):
     return 0
 
 
+def _selection_models(args, esm, ws):
+    """(placements, base_models) for the current selection — interior or exterior.
+    Shared by --list-models and the model editor."""
+    order = _load_order(esm, args.plugin)
+    if args.interior:
+        ex = _parse_interiors(order)
+        fid, _info = ex.find(args.interior)
+        if fid is None:
+            raise SystemExit("Interior '%s' not found (try --list-interiors)." % args.interior)
+        return {(0, 0): ex.placements.get(fid, [])}, ex.base_models
+    if args.region:
+        bounds = REGIONS[args.region]
+    elif args.cells:
+        bounds = _parse_cells(args.cells)
+    else:
+        raise SystemExit("--list-models needs --cells/--region or --interior.")
+    ex = _parse_load_order(order, target_ws=ws, bounds=bounds, models=True)
+    return ex.placements, ex.base_models
+
+
+def _list_models(args, esm, ws):
+    placements, base_models = _selection_models(args, esm, ws)
+    counts = {}
+    for plist in placements.values():
+        for p in plist:
+            modl = base_models.get(p["base"])
+            if modl:
+                counts[modl] = counts.get(modl, 0) + 1
+    filt = (args.list_models or "").lower()
+    n = 0
+    for modl, c in sorted(counts.items()):
+        if filt and filt not in modl.lower():
+            continue
+        kind = "tree" if modl.lower().endswith(".spt") else "mesh"
+        print("  %-62s %5d  %s" % (modl, c, kind))
+        n += 1
+    print("%d models%s. Edit per-model settings in the GUI 'Model edits' tab "
+          "(saved to a --model-overrides JSON)." % (n, " match '%s'" % filt if filt else ""))
+    return 0
+
+
+def _load_model_overrides(path):
+    """Read a --model-overrides JSON into {nif_path_lower: settings}. Tolerant of a
+    missing file (returns {}). Keys are lowercased so lookups are case-insensitive."""
+    if not path:
+        return None
+    if not os.path.isfile(path):
+        print("[warn] --model-overrides file not found: %s (ignoring)" % path)
+        return None
+    import json
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    return {str(k).lower(): v for k, v in raw.items()}
+
+
 class _InteriorShim:
     """Quacks like TerrainExtractor for _run_models: one cell of placements."""
     def __init__(self, refs, base_models):
@@ -715,6 +803,17 @@ def _build_interior(args, esm):
     out_parent = os.path.dirname(os.path.abspath(args.out))
     os.makedirs(out_parent, exist_ok=True)
 
+    # Interiors are walked INTO, not past: the room shell must be SOLID or the
+    # player falls through the floor onto the sealed box below and can't move.
+    # 'auto' (big meshes non-solid) is an exterior default — remap it to 'full'
+    # (prop_static supports concave per-triangle collision). Explicit
+    # none/acd/full are respected.
+    if args.collision == "auto":
+        args.collision = "full"
+        print("[note] interior: using --collision full (solid room shell so you can "
+              "walk on floors / be blocked by walls). Pass --collision none for "
+              "walk-through, or acd for decomposed walk-in.")
+
     shim = _InteriorShim(refs, ex.base_models)
     placements = model_map = model_scale = None
     skip_models = set()
@@ -729,15 +828,68 @@ def _build_interior(args, esm):
                                light_bases=ex.lights, ambient=info.get("ambient"),
                                angle_sign=(-1.0 if args.angle_sign == "neg" else 1.0),
                                yaw_offset=args.yaw_offset, model_scale=model_scale,
-                               skip_models=skip_models)
+                               skip_models=skip_models, skybox_room=args.skybox_room)
     b = stats["bounds"]
     print("  props:   %d placed (%d skipped)" % (stats["props"], stats["props_skipped"]))
     print("  lights:  %d" % stats["lights"])
     print("  room:    %.0f x %.0f x %.0f HU"
           % (b[1] - b[0], b[3] - b[2], b[5] - b[4]))
-    print("Wrote %s" % args.out)
-    print("Compile: ./scripts/compile_map.ps1 -Map %s" % args.out)
+
+    # The .mdl props compiled straight into the gamedir, but their .vmt/.vtf
+    # materials were written next to the .vmf. Without these in GarrysMod the
+    # props render as a pink/black checkerboard. Auto-copy them into the gamedir
+    # (the user's own local assets) and always print the reminder as a fallback.
+    mats_dir = os.path.join(out_parent, "materials")
+    if args.models and os.path.isdir(mats_dir):
+        copied = False
+        if not args.skip_compile:
+            from . import model as modelmod
+            gamedir = modelmod.find_gamedir(args.gamedir)
+            if gamedir:
+                n = _copy_tree_into(mats_dir, os.path.join(gamedir, "materials"))
+                print("  materials:      %d file(s) copied -> %s\\materials\\"
+                      % (n, gamedir))
+                copied = True
+        if not copied:
+            print("  materials dir:  %s" % mats_dir)
+            print("  -> copy the 'materials' folder into your GarrysMod\\garrysmod\\ "
+                  "so the prop textures load (else they show pink/black checkerboard).")
+
+    print("Wrote %s%s" % (args.out, "  (skybox room)" if args.skybox_room else ""))
+
+    if args.instance_into:
+        from .vmf import add_instance_to_vmf
+        origin = None
+        if args.instance_origin:
+            try:
+                origin = tuple(float(v) for v in args.instance_origin.split(","))
+                if len(origin) != 3:
+                    raise ValueError
+            except ValueError:
+                raise SystemExit("--instance-origin must be X,Y,Z (3 numbers)")
+        o, rel = add_instance_to_vmf(args.instance_into, args.out, origin=origin,
+                                     targetname=info["edid"])
+        print("  instance:       added func_instance \"%s\" at (%.0f %.0f %.0f) in %s"
+              % (rel, o[0], o[1], o[2], args.instance_into))
+        print("Compile the HOST map: ./scripts/compile_map.ps1 -Map %s" % args.instance_into)
+    else:
+        print("Compile: ./scripts/compile_map.ps1 -Map %s" % args.out)
     return 0
+
+
+def _copy_tree_into(src, dst):
+    """Recursively copy ``src``'s contents into ``dst`` (merging into any existing
+    tree, overwriting files). Returns the number of files copied."""
+    import shutil
+    n = 0
+    for root, _dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        target = dst if rel == "." else os.path.join(dst, rel)
+        os.makedirs(target, exist_ok=True)
+        for fn in files:
+            shutil.copy2(os.path.join(root, fn), os.path.join(target, fn))
+            n += 1
+    return n
 
 
 def _run_models(args, ex, out_parent, source):
@@ -774,7 +926,9 @@ def _run_models(args, ex, out_parent, source):
         flip_winding=args.flip_winding, flip_v=args.flip_v,
         collision=args.collision, collision_size=args.collision_size,
         acd_threshold=args.acd_threshold, acd_max_hulls=args.acd_max_hulls,
-        acd_jobs=(args.acd_jobs or None), model_lods=args.model_lods,
+        acd_jobs=(args.acd_jobs or None), ramp_axis=args.ramp_axis,
+        model_overrides=_load_model_overrides(args.model_overrides),
+        model_lods=args.model_lods,
         trees=args.trees,
         tree_model=args.tree_model, tree_scale=args.tree_scale, tree_map=tree_map,
         jobs=(args.jobs or None), use_cache=args.cache)
@@ -782,6 +936,8 @@ def _run_models(args, ex, out_parent, source):
     print("  meshes:         %d unique, %d converted (%d reused from cache), %d failed, %d tree species"
           % (mstats["unique_meshes"], mstats["converted"], mstats.get("cached", 0),
              mstats["failed"], mstats["trees"]))
+    if mstats.get("skipped"):
+        print("  model edits:    %d mesh(es) skipped via --model-overrides" % mstats["skipped"])
     print("  model textures: %d converted, %d fell back to placeholder"
           % (mstats["textures"], mstats["textures_failed"]))
     print("  model sources:  %s" % work_dir)
