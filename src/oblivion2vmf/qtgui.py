@@ -2221,25 +2221,101 @@ class Main(QtWidgets.QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_havok_ready(self, modl, parts):
-        if isinstance(parts, tuple) and parts and parts[0] == "err":
+        batch = getattr(self, "_havok_batch", None)
+        if modl == "" and isinstance(parts, tuple) and parts and parts[0] == "done":
+            if batch:
+                self._append("Havok (parallel) done: %d/%d models got exact collision, "
+                             "%d had no Havok, %d errored. Save overrides."
+                             % (batch["ok"], batch["total"], batch["nocoll"], batch["fail"]))
+                self._havok_batch = None
+                cur = self.cur_model
+                if (cur and self.plotter is not None
+                        and self.model_rows.get(cur, {}).get("acd_parts")):
+                    self.cur_model = None
+                    self._load_model_3d(cur)
+            return
+        err = isinstance(parts, tuple) and parts and parts[0] == "err"
+        row = self.model_rows.get(modl)
+        if not err and parts and row is not None:
+            row["acd_parts"] = [[[list(map(float, v)) for v in pv_],
+                                 [list(map(int, f)) for f in pf]] for pv_, pf in parts]
+            row["collision"].setCurrentText("acd")  # acd_parts path bakes them verbatim
+        if batch is not None:                        # tally only — no per-model log spam
+            if err:
+                batch["fail"] += 1
+            elif not parts:
+                batch["nocoll"] += 1
+            elif row is not None:
+                batch["ok"] += 1
+            return
+        if err:
             self._append("Havok decomposition failed: %s" % parts[1])
             return
         if not parts:
             self._append("%s has no Havok collision in its .nif (or the NIF wasn't "
                          "found in your BSA/data dir)." % os.path.basename(modl))
             return
-        row = self.model_rows.get(modl)
         if row is None:
             self._append("Model %s is not in the table; re-scan." % modl)
             return
-        row["acd_parts"] = [[[list(map(float, v)) for v in pv_],
-                             [list(map(int, f)) for f in pf]] for pv_, pf in parts]
-        row["collision"].setCurrentText("acd")     # acd_parts path bakes them verbatim
         self._append("Havok exact collision for %s: %d convex piece(s) from coplanar "
                      "faces. Save overrides to keep them." % (os.path.basename(modl), len(parts)))
         if modl == self.cur_model and self.plotter is not None:
             self.cur_model = None
             self._load_model_3d(modl)
+
+    def _havok_all_parallel(self):
+        """Generate exact Havok collision for EVERY model in the table at once,
+        across a thread pool — each NIF read + decomposition runs concurrently."""
+        if not self.model_rows:
+            self._append("Load models first (Scan / Load compiled).")
+            return
+        dd = self.getters["data_dir"]().strip() if "data_dir" in self.getters else ""
+        if not self.bsa_list and not dd:
+            self._append("Add the Meshes BSA (or a loose Data dir) on the Input tab first.")
+            return
+        if getattr(self, "_havok_batch", None):
+            self._append("A parallel Havok pass is already running.")
+            return
+        try:
+            scl = float(self.getters["scale"]())
+        except (ValueError, KeyError):
+            scl = 1.0
+        try:
+            jobs = int(self.getters["jobs"]()) or None
+        except (ValueError, KeyError):
+            jobs = None
+        bsas = list(self.bsa_list)
+        modls = list(self.model_rows.keys())
+        self._havok_batch = {"total": len(modls), "ok": 0, "nocoll": 0, "fail": 0}
+        self._append("Havok exact collision for %d models in parallel…" % len(modls))
+
+        def coordinator():
+            from concurrent.futures import ThreadPoolExecutor
+            from .bsa import DataSource
+            from . import nif
+            from .model import coplanar_convex_pieces
+            src = DataSource(data_dir=(dd or None), bsa_paths=bsas)
+            nworkers = max(1, jobs or min(8, (os.cpu_count() or 4)))
+
+            def one(m):
+                try:
+                    data = src.get_mesh(m)
+                    coll = nif.extract_collision(data) if data else None
+                    if not coll:
+                        self.havok_ready.emit(m, None)
+                        return
+                    subs = [{"verts": [[v[0] * scl, v[1] * scl, v[2] * scl]
+                                       for v in s["verts"]],
+                             "tris": [list(t) for t in s["tris"]]} for s in coll]
+                    self.havok_ready.emit(m, coplanar_convex_pieces(subs, jobs=1))
+                except Exception as e:
+                    self.havok_ready.emit(m, ("err", repr(e)))
+            with ThreadPoolExecutor(max_workers=nworkers) as ex:
+                list(ex.map(one, modls))
+            self.havok_ready.emit("", ("done", len(modls)))
+        import threading
+        threading.Thread(target=coordinator, daemon=True).start()
 
     def _import_nif_collision(self):
         """Pull the model's authored Havok collision shell straight from the .nif
