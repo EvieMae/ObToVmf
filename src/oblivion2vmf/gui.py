@@ -49,6 +49,7 @@ class App:
         self.bsa_list = list(self.cfg.get("bsa", []))
         self.plugin_list = list(self.cfg.get("plugins", []))   # load order (--plugin)
         self.interiors = []          # [(edid, name, refs)] from last scan
+        self.model_rows = {}         # nif path -> {collision,ramp,scale,surf,skip} vars
         self._build()
         self._poll()
         root.protocol("WM_DELETE_WINDOW", self._close)
@@ -91,6 +92,7 @@ class App:
         self._tab_models(nb)
         self._tab_trees(nb)
         self._tab_interiors(nb)
+        self._tab_model_edits(nb)
 
         bar = ttk.Frame(self.root)
         bar.pack(fill="x")
@@ -174,7 +176,9 @@ class App:
         ttk.Checkbutton(f, text="Reuse model cache (skip unchanged models)",
                         variable=self._bv("cache", True)).grid(
             row=1, column=2, sticky="w", padx=4)
-        self._combo(f, 2, "Collision", "collision", ["auto", "acd", "full", "none"], "acd")
+        self._combo(f, 2, "Collision", "collision",
+                    ["auto", "acd", "full", "bbox", "ramp", "none"], "acd")
+        self._combo(f, 12, "Ramp axis (rise)", "ramp_axis", ["+x", "-x", "+y", "-y"], "+x")
         self._row(f, 3, "Collision size (HU)", "collision_size", "400")
         self._row(f, 4, "ACD threshold", "acd_threshold", "0.08")
         self._row(f, 11, "ACD max hulls (-1=none)", "acd_max_hulls", "-1")
@@ -218,9 +222,24 @@ class App:
         ttk.Button(top, text="List interiors", command=self._scan_interiors).pack(side="left", padx=4)
         ttk.Button(top, text="Build selected room",
                    command=self._build_interior).pack(side="left", padx=4)
+
+        opts = ttk.Frame(f)
+        opts.grid(row=1, column=0, sticky="we", padx=4, pady=2)
+        self.v["skybox_room"] = tk.BooleanVar(value=bool(self.cfg.get("skybox_room", False)))
+        ttk.Checkbutton(opts, text="Skybox room (toolsskybox wrap, not sealed black)",
+                        variable=self.v["skybox_room"]).pack(side="left")
+        opts2 = ttk.Frame(f)
+        opts2.grid(row=2, column=0, sticky="we", padx=4, pady=2)
+        self.v["instance_into"] = tk.BooleanVar(value=bool(self.cfg.get("instance_into", False)))
+        ttk.Checkbutton(opts2, text="Add as func_instance into host map:",
+                        variable=self.v["instance_into"]).pack(side="left")
+        self.v["instance_host"] = tk.StringVar(value=str(self.cfg.get("instance_host", "")))
+        ttk.Entry(opts2, textvariable=self.v["instance_host"], width=40).pack(side="left", padx=4)
+        ttk.Button(opts2, text="…", width=3, command=lambda: self._pick_host()).pack(side="left")
+
         wrap = ttk.Frame(f)
-        wrap.grid(row=1, column=0, sticky="nswe", padx=4, pady=4)
-        f.rowconfigure(1, weight=1)
+        wrap.grid(row=3, column=0, sticky="nswe", padx=4, pady=4)
+        f.rowconfigure(3, weight=1)
         self.int_box = tk.Listbox(wrap, font=("Consolas", 9), activestyle="dotbox")
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.int_box.yview)
         self.int_box.configure(yscrollcommand=sb.set)
@@ -228,8 +247,15 @@ class App:
         sb.pack(side="right", fill="y")
         self.int_box.bind("<Double-Button-1>", lambda e: self._build_interior())
         ttk.Label(f, text="Lists interior cells across your load order. Build uses the Models-tab "
-                          "settings; output is <EDID>.vmf next to your main Output .vmf.").grid(
-            row=2, column=0, sticky="w", padx=4, pady=2)
+                          "settings; output is <EDID>.vmf next to your main Output .vmf. "
+                          "func_instance places the room beside the host's geometry and you "
+                          "compile the HOST map.").grid(
+            row=4, column=0, sticky="w", padx=4, pady=2)
+
+    def _pick_host(self):
+        p = filedialog.askopenfilename(filetypes=[("VMF", "*.vmf"), ("All", "*.*")])
+        if p:
+            self.v["instance_host"].set(p)
 
     def _scan_interiors(self):
         filt = self.v["int_filter"].get().strip()
@@ -270,6 +296,15 @@ class App:
         out = os.path.join(out_dir, edid + ".vmf")
         a = self._common_args() + ["--interior", edid, "--out", out,
                                     "--scale", self.v["scale"].get()]
+        if self.v["skybox_room"].get():
+            a.append("--skybox-room")
+        if self.v["instance_into"].get():
+            host = self.v["instance_host"].get().strip()
+            if not host:
+                self._append("Tick 'func_instance' but pick a host .vmf first "
+                             "(or untick it).\n")
+                return
+            a += ["--instance-into", host]
         if self.v["models"].get():
             a.append("--models")
             a += self._model_args()
@@ -278,6 +313,234 @@ class App:
         self._append("\n$ " + " ".join(a) + "\n")
         self.run_btn.config(state="disabled")
         threading.Thread(target=self._exec, args=(a,), daemon=True).start()
+
+    # ---- model edits (per-model overrides) ----
+    _COLL_CHOICES = ["(global)", "auto", "acd", "full", "bbox", "ramp", "hulls", "none"]
+    _AXIS_CHOICES = ["+x", "-x", "+y", "-y"]
+
+    def _work_dir(self):
+        """The models_src dir (compiled-model SMD sources + build cache), beside
+        the Output .vmf — same path the CLI uses."""
+        out_dir = os.path.dirname(os.path.abspath(self.v["out"].get())) or "."
+        return os.path.join(out_dir, "models_src")
+
+    def _tab_model_edits(self, nb):
+        f = ttk.Frame(nb)
+        nb.add(f, text="Model edits")
+        f.columnconfigure(0, weight=1)
+
+        top = ttk.Frame(f)
+        top.grid(row=0, column=0, sticky="we", padx=4, pady=4)
+        ttk.Label(top, text="Source").pack(side="left")
+        self.v["model_src"] = tk.StringVar(value=str(self.cfg.get("model_src", "Exterior")))
+        ttk.Combobox(top, textvariable=self.v["model_src"], width=10, state="readonly",
+                     values=["Exterior", "Interior"]).pack(side="left", padx=4)
+        ttk.Label(top, text="Filter").pack(side="left")
+        self.v["model_filter"] = tk.StringVar(value=str(self.cfg.get("model_filter", "")))
+        ttk.Entry(top, textvariable=self.v["model_filter"], width=18).pack(side="left", padx=4)
+        ttk.Button(top, text="Scan models", command=self._scan_models).pack(side="left", padx=4)
+        ttk.Button(top, text="Load compiled", command=self._load_compiled_models).pack(side="left", padx=4)
+        ttk.Button(top, text="Save overrides", command=self._save_overrides).pack(side="left", padx=4)
+
+        of = ttk.Frame(f)
+        of.grid(row=1, column=0, sticky="we", padx=4, pady=2)
+        ttk.Label(of, text="Overrides JSON").pack(side="left")
+        self._sv("model_overrides", "")
+        ttk.Entry(of, textvariable=self.v["model_overrides"], width=48).pack(side="left", padx=4)
+        ttk.Button(of, text="…", width=3,
+                   command=lambda: self._browse("model_overrides", "open")).pack(side="left")
+
+        # column headers
+        hdr = ttk.Frame(f)
+        hdr.grid(row=2, column=0, sticky="we", padx=4)
+        for c, (txt, w) in enumerate([("Model (.nif)", 44), ("n", 4), ("Collision", 10),
+                                      ("Ramp", 5), ("Scale", 6), ("Surfaceprop", 12),
+                                      ("Skip", 4), ("3D", 6)]):
+            ttk.Label(hdr, text=txt, width=w, anchor="w").grid(row=0, column=c, padx=2)
+
+        # scrollable rows area
+        wrap = ttk.Frame(f)
+        wrap.grid(row=3, column=0, sticky="nswe", padx=4, pady=4)
+        f.rowconfigure(3, weight=1)
+        self.me_canvas = tk.Canvas(wrap, highlightthickness=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.me_canvas.yview)
+        self.me_canvas.configure(yscrollcommand=sb.set)
+        self.me_canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.me_rows = ttk.Frame(self.me_canvas)
+        self.me_win = self.me_canvas.create_window((0, 0), window=self.me_rows, anchor="nw")
+        self.me_rows.bind("<Configure>", lambda e: self.me_canvas.configure(
+            scrollregion=self.me_canvas.bbox("all")))
+        self.me_canvas.bind("<Configure>", lambda e: self.me_canvas.itemconfig(
+            self.me_win, width=e.width))
+
+        ttk.Label(f, text="Scan lists every mesh placed in your selection (Exterior uses the "
+                          "Main-tab Cells; Interior uses the room selected on the Interiors "
+                          "tab). Set per-model collision/ramp/scale/surfaceprop or Skip, then "
+                          "Save overrides. Builds auto-use this JSON.").grid(
+            row=4, column=0, sticky="w", padx=4, pady=2)
+
+    def _scan_models(self):
+        a = self._common_args() + ["--list-models"]
+        if self.v["model_src"].get() == "Interior":
+            sel = self.int_box.curselection() if hasattr(self, "int_box") else ()
+            if not sel:
+                self._append("Interior source: select a room on the Interiors tab first.\n")
+                return
+            a += ["--interior", self.interiors[sel[0]][0]]
+        else:
+            a.append("--cells=" + self.v["cells"].get().replace(" ", ""))
+        filt = self.v["model_filter"].get().strip()
+        if filt:
+            a.append(filt)
+        self._append("Scanning models…\n")
+
+        def work():
+            try:
+                r = subprocess.run(a, capture_output=True, text=True, env=self._env())
+                self.q.put(("models", r.stdout))
+                if r.returncode != 0:
+                    self.q.put(("log", (r.stderr or "")[-1200:]))
+            except Exception as e:
+                self.q.put(("log", "model scan failed: %r\n" % e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_models(self, stdout):
+        models = []
+        for line in stdout.splitlines():
+            m = re.match(r"\s+(\S+)\s+(\d+)\s+(mesh|tree)\s*$", line)
+            if m:
+                models.append((m.group(1), int(m.group(2))))
+        self._populate_models(models, "scan")
+
+    def _load_compiled_models(self):
+        """Populate rows from every model currently compiled (the build cache in
+        models_src) — no ESM scan needed."""
+        cache = os.path.join(self._work_dir(), ".build_cache.json")
+        if not os.path.isfile(cache):
+            self._append("No build cache at %s — compile a build first "
+                         "(or use Scan models).\n" % cache)
+            return
+        try:
+            with open(cache, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            self._append("could not read build cache: %r\n" % e)
+            return
+        filt = self.v["model_filter"].get().strip().lower()
+        models = [(modl, 0) for modl in sorted(data) if not filt or filt in modl.lower()]
+        self._populate_models(models, "compiled")
+
+    def _populate_models(self, models, source):
+        for w in self.me_rows.winfo_children():
+            w.destroy()
+        self.model_rows = {}
+        saved = self._read_overrides_file()
+        for i, (modl, n) in enumerate(models):
+            ov = saved.get(modl.lower(), {})
+            tail = modl if len(modl) <= 44 else "…" + modl[-43:]
+            ttk.Label(self.me_rows, text=tail, width=44, anchor="w").grid(
+                row=i, column=0, padx=2, sticky="w")
+            ttk.Label(self.me_rows, text=(str(n) if n else "·"), width=4,
+                      anchor="e").grid(row=i, column=1, padx=2)
+            coll = tk.StringVar(value=ov.get("collision") or "(global)")
+            ttk.Combobox(self.me_rows, textvariable=coll, values=self._COLL_CHOICES,
+                         width=9, state="readonly").grid(row=i, column=2, padx=2)
+            ramp = tk.StringVar(value=ov.get("ramp_axis") or "+x")
+            ttk.Combobox(self.me_rows, textvariable=ramp, values=self._AXIS_CHOICES,
+                         width=4, state="readonly").grid(row=i, column=3, padx=2)
+            scale = tk.StringVar(value=("" if ov.get("scale") in (None, 1.0)
+                                        else str(ov.get("scale"))))
+            ttk.Entry(self.me_rows, textvariable=scale, width=6).grid(row=i, column=4, padx=2)
+            surf = tk.StringVar(value=ov.get("surfaceprop") or "")
+            ttk.Entry(self.me_rows, textvariable=surf, width=12).grid(row=i, column=5, padx=2)
+            skip = tk.BooleanVar(value=bool(ov.get("skip")))
+            ttk.Checkbutton(self.me_rows, variable=skip).grid(row=i, column=6, padx=2)
+            row = {"collision": coll, "ramp": ramp, "scale": scale, "surf": surf,
+                   "skip": skip, "hulls": list(ov.get("hulls") or [])}
+            self.model_rows[modl] = row
+            ttk.Button(self.me_rows, text="Hulls…", width=6,
+                       command=lambda m=modl: self._edit_hulls(m)).grid(row=i, column=7, padx=2)
+        self._append("Loaded %d models (%s; %d with saved overrides).\n"
+                     % (len(models), source,
+                        sum(1 for k in self.model_rows if k.lower() in saved)))
+
+    def _edit_hulls(self, modl):
+        from . import hullview
+        from .model import slugify
+        smd = os.path.join(self._work_dir(), slugify(modl) + ".smd")
+        if not os.path.isfile(smd):
+            self._append("No compiled SMD for %s at %s — build it first "
+                         "(needs models_src).\n" % (modl, smd))
+            return
+        row = self.model_rows[modl]
+
+        def on_save(hulls):
+            row["hulls"] = hulls
+            if hulls:
+                row["collision"].set("hulls")
+            self._append("%s: %d hull box(es) set (remember to Save overrides).\n"
+                         % (modl, len(hulls)))
+        try:
+            hullview.open_hull_editor(self.root, os.path.basename(modl), smd,
+                                      row["hulls"], on_save)
+        except Exception as e:
+            self._append("could not open 3D editor: %r\n" % e)
+
+    def _read_overrides_file(self):
+        path = self.v["model_overrides"].get().strip()
+        if path and os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    return {str(k).lower(): v for k, v in json.load(fh).items()}
+            except Exception as e:
+                self._append("could not read overrides JSON: %r\n" % e)
+        return {}
+
+    def _overrides_from_rows(self):
+        """Collapse the editor rows into {nif_lower: settings}, dropping defaults."""
+        out = {}
+        for modl, r in self.model_rows.items():
+            d = {}
+            if r["collision"].get() not in ("(global)", ""):
+                d["collision"] = r["collision"].get()
+                if d["collision"] == "ramp":
+                    d["ramp_axis"] = r["ramp"].get()
+                if d["collision"] == "hulls" and r.get("hulls"):
+                    d["hulls"] = [[round(float(c), 2) for c in b] for b in r["hulls"]]
+            sc = r["scale"].get().strip()
+            if sc:
+                try:
+                    if float(sc) != 1.0:
+                        d["scale"] = float(sc)
+                except ValueError:
+                    pass
+            if r["surf"].get().strip():
+                d["surfaceprop"] = r["surf"].get().strip()
+            if r["skip"].get():
+                d["skip"] = True
+            if d:
+                out[modl.lower()] = d
+        return out
+
+    def _save_overrides(self):
+        path = self.v["model_overrides"].get().strip()
+        if not path:
+            out_dir = os.path.dirname(os.path.abspath(self.v["out"].get())) or "."
+            path = os.path.join(out_dir, "model_overrides.json")
+            self.v["model_overrides"].set(path)
+        # merge: keep entries for models not currently listed, overwrite listed ones
+        merged = self._read_overrides_file()
+        listed = {k.lower() for k in self.model_rows}
+        merged = {k: v for k, v in merged.items() if k not in listed}
+        merged.update(self._overrides_from_rows())
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(merged, fh, indent=2, sort_keys=True)
+            self._append("Saved %d model override(s) -> %s\n" % (len(merged), path))
+        except Exception as e:
+            self._append("save overrides failed: %r\n" % e)
 
     def _populate(self, species, mapping):
         for w in self.species_frame.winfo_children():
@@ -358,7 +621,11 @@ class App:
             a.append("--skip-compile")
         if not self.v["cache"].get():
             a.append("--no-cache")
+        ov = self.v.get("model_overrides")
+        if ov is not None and ov.get().strip():
+            a += ["--model-overrides", ov.get().strip()]
         a += ["--collision", self.v["collision"].get(),
+              "--ramp-axis", self.v["ramp_axis"].get(),
               "--collision-size", self.v["collision_size"].get(),
               "--acd-threshold", self.v["acd_threshold"].get(),
               "--acd-max-hulls", (self.v["acd_max_hulls"].get().strip() or "-1"),
@@ -475,6 +742,8 @@ class App:
                     self._populate(data, self.cfg.get("tree_map", {}))
                 elif kind == "interiors":
                     self._set_interiors(data)
+                elif kind == "models":
+                    self._set_models(data)
                 elif kind == "done":
                     self.run_btn.config(state="normal")
         except queue.Empty:

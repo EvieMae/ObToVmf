@@ -148,6 +148,91 @@ def write_collision_smd(parts, path, scale=1.0, material="phys"):
         f.write("\n".join(out) + "\n")
 
 
+def _aabb(subs):
+    """Axis-aligned bounds of all submesh verts as (x0,y0,z0,x1,y1,z1) in MODEL
+    units (pre-scale), or None when empty."""
+    vs = [v for s in subs for v in s["verts"]]
+    if not vs:
+        return None
+    xs = [v[0] for v in vs]; ys = [v[1] for v in vs]; zs = [v[2] for v in vs]
+    return (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
+
+
+# the 12 triangles (as vertex-index triples) of a box given 8 corners ordered
+# bottom 0-3 (z0) then top 4-7 (z1), each ring CCW in XY
+_BOX_FACES = [(0, 1, 2), (0, 2, 3), (4, 6, 5), (4, 7, 6),
+              (0, 4, 5), (0, 5, 1), (1, 5, 6), (1, 6, 2),
+              (2, 6, 7), (2, 7, 3), (3, 7, 4), (3, 4, 0)]
+
+
+def box_hull(bounds):
+    """A single convex box (AABB) collision part [(verts, faces)] from bounds."""
+    x0, y0, z0, x1, y1, z1 = bounds
+    verts = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+             (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    return (verts, list(_BOX_FACES))
+
+
+# triangular-prism (wedge) faces for 6 verts: bottom rect 0-3, sloped top edge 4-5
+_WEDGE_FACES = [(0, 1, 2), (0, 2, 3),          # bottom
+                (0, 4, 5), (0, 5, 1),          # the two sloped quads -> ramp surface
+                (3, 2, 5), (3, 5, 4),
+                (0, 3, 4), (1, 5, 2)]          # the two triangular ends
+
+
+def ramp_hull(bounds, axis="+x"):
+    """A single convex wedge: a ramp that rises from z0 to z1 along ``axis`` (one
+    of +x,-x,+y,-y). The player walks UP the slope instead of hitting a wall.
+    Returns one collision part [(verts, faces)]."""
+    x0, y0, z0, x1, y1, z1 = bounds
+    # bottom rectangle (full footprint at z0), then the top edge is a single raised
+    # line on the 'high' side -> a triangular prism. Pick which side is high.
+    if axis in ("+x", "-x"):
+        hi_x = x1 if axis == "+x" else x0
+        verts = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+                 (hi_x, y0, z1), (hi_x, y1, z1)]
+    else:
+        hi_y = y1 if axis == "+y" else y0
+        verts = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+                 (x0, hi_y, z1), (x1, hi_y, z1)]
+    return (verts, list(_WEDGE_FACES))
+
+
+def trap_hull(bounds, top_scale=0.5):
+    """A trapezoidal prism (frustum): full-footprint bottom rectangle at z0, top
+    rectangle at z1 scaled by ``top_scale`` about the footprint centre. One convex
+    hull — same vertex topology as a box, so it reuses ``_BOX_FACES``."""
+    x0, y0, z0, x1, y1, z1 = bounds
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    s = max(0.05, min(1.0, float(top_scale)))
+    hx, hy = (x1 - x0) / 2.0 * s, (y1 - y0) / 2.0 * s
+    verts = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+             (cx - hx, cy - hy, z1), (cx + hx, cy - hy, z1),
+             (cx + hx, cy + hy, z1), (cx - hx, cy + hy, z1)]
+    return (verts, list(_BOX_FACES))
+
+
+def hull_from_spec(spec):
+    """One convex collision part from a hull spec. Accepts the legacy 6-float box
+    list, or a dict {"type": "box"|"wedge"|"trap", "bounds": [x0,y0,z0,x1,y1,z1],
+    "axis": "+x" (wedge), "top_scale": 0.5 (trap)}. Returns (verts, faces) or
+    None for a malformed spec."""
+    if isinstance(spec, dict):
+        b = spec.get("bounds") or []
+        if len(b) != 6:
+            return None
+        b = tuple(float(c) for c in b)
+        t = (spec.get("type") or "box").lower()
+        if t == "wedge":
+            return ramp_hull(b, spec.get("axis", "+x"))
+        if t in ("trap", "trapezoid", "trapezium"):
+            return trap_hull(b, spec.get("top_scale", 0.5))
+        return box_hull(b)
+    if len(spec) == 6:
+        return box_hull(tuple(float(c) for c in spec))
+    return None
+
+
 def write_qc(path, modelname, ref_smd, surfaceprop="default", scale=1.0,
              cdmaterials="models/" + MODEL_PREFIX, collision_smd=None, max_convex=64,
              lods=None):
@@ -747,9 +832,10 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                  compile_models=True, materials_root=None,
                  flip_winding=FLIP_WINDING, flip_v=FLIP_V,
                  collision="auto", collision_size=400.0, acd_threshold=0.08,
-                 acd_max_hulls=-1, acd_jobs=None, model_lods=True,
+                 acd_max_hulls=-1, acd_jobs=None, ramp_axis="+x", model_lods=True,
                  trees=True, tree_model=None, tree_scale=1.0, tree_map=None,
-                 jobs=None, use_cache=True, cache_rebuild=False, log=print):
+                 jobs=None, use_cache=True, cache_rebuild=False, model_overrides=None,
+                 log=print):
     """Convert every unique mesh referenced by ``placements`` to a .mdl.
 
     base_models : {base_formid: modl_path}
@@ -813,11 +899,20 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             except Exception:
                 pass
 
-    def _sig(data):
-        key = "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
+    overrides = model_overrides or {}
+
+    def _override(modl):
+        """Per-model settings dict (collision/ramp_axis/scale/surfaceprop/skip),
+        looked up case-insensitively by .nif path. Empty when none set."""
+        return overrides.get(modl.lower(), overrides.get(modl, {})) or {}
+
+    def _sig(data, ov):
+        key = "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s" % (
             hashlib.sha1(data).hexdigest(), GEOM_REV, prefix, scale, flip_winding,
             flip_v, collision, collision_size, acd_threshold, acd_max_hulls,
-            "lod" if model_lods else "nolod")
+            ramp_axis if collision == "ramp" else "-",
+            "lod" if model_lods else "nolod",
+            json.dumps(ov, sort_keys=True) if ov else "-")
         return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
     def _build_one(modl):
@@ -828,13 +923,21 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
         model_path = "models/%s/%s.mdl" % (prefix, slug)
         res = {"modl": modl, "model_path": None, "textures": {},
                "failure": None, "logs": [], "cached": False, "cache_entry": None}
+        ov = _override(modl)
+        if ov.get("skip"):
+            res["skipped"] = True             # excluded by the model editor
+            return res
+        m_collision = ov.get("collision") or collision
+        m_ramp = ov.get("ramp_axis") or ramp_axis
+        m_scale = scale * float(ov.get("scale", 1.0) or 1.0)
+        m_surf = ov.get("surfaceprop") or "default"
         try:
             data = source.get_mesh(modl)
             if data is None:
                 res["failure"] = (modl, "not found in data dir / BSAs")
                 return res
             # cache hit: signature matches and the compiled .mdl is still on disk
-            sig = _sig(data)
+            sig = _sig(data, ov)
             if use_cache and compile_models and gamedir:
                 ent = cache.get(modl)
                 if (ent and ent.get("sig") == sig
@@ -861,16 +964,16 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 if gamedir and os.path.exists(os.path.join(gamedir, model_path)):
                     res["model_path"] = model_path
                     res["cache_entry"] = {"sig": sig, "model_path": model_path,
-                                          "textures": res["textures"], "collision": collision}
+                                          "textures": res["textures"], "collision": m_collision}
                     _commit(modl, res["cache_entry"])
                 else:
                     res["failure"] = (modl, "no compiled .mdl in gamedir to cache")
                 return res
             ref_smd = os.path.join(work_dir, slug + ".smd")
             qc = os.path.join(work_dir, slug + ".qc")
-            write_smd(subs, ref_smd, scale=scale,
+            write_smd(subs, ref_smd, scale=m_scale,
                       flip_winding=flip_winding, flip_v=flip_v)
-            lods = (_model_lods(subs, slug, work_dir, scale, flip_winding, flip_v)
+            lods = (_model_lods(subs, slug, work_dir, m_scale, flip_winding, flip_v)
                     if model_lods else [])
 
             # Collision source: the NIF's own Havok shell (clean structural mesh)
@@ -884,13 +987,39 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             # Modes: none=off; full=solid all; auto=small solid / big non-solid
             # (walk through buildings); acd=small solid / big convex-decomposed
             # (walk INTO buildings accurately, needs coacd).
-            big = _horizontal_extent(subs, scale) > collision_size
+            big = _horizontal_extent(subs, m_scale) > collision_size
             phys = os.path.join(work_dir, slug + "_phys.smd")
             coll_smd, maxc = None, 64
-            if collision == "none":
+            if ov.get("acd_parts"):
+                # Convex parts authored/previewed in the GUI 3D editor — bake them
+                # verbatim (final SMD units, scale 1.0) instead of recomputing CoACD.
+                parts = [(pv_, [tuple(f) for f in pf]) for pv_, pf in ov["acd_parts"]]
+                if parts:
+                    write_collision_smd(parts, phys, scale=1.0)
+                    coll_smd, maxc = phys, max(64, len(parts) + 8)
+            elif m_collision == "none":
                 pass
-            elif big and collision in ("auto", "acd"):
-                if collision == "acd" and acd.available():
+            elif m_collision == "hulls":
+                # Multiple hand-authored hulls (GUI 3D editor): boxes, wedges, or
+                # trapezoidal prisms. Coords are in FINAL (SMD/Hammer) units ->
+                # written as-is (scale 1.0).
+                parts = [p for p in (hull_from_spec(s) for s in (ov.get("hulls") or []))
+                         if p is not None]
+                if parts:
+                    write_collision_smd(parts, phys, scale=1.0)
+                    coll_smd, maxc = phys, max(64, len(parts) + 8)
+            elif m_collision in ("bbox", "ramp"):
+                # Single convex primitive sized to the mesh bounds: a box (cheap
+                # blocking volume) or a wedge ramp (walk UP the slope). Both are
+                # one convex hull -> trivial physics.
+                bb = _aabb(coll_subs)
+                if bb:
+                    part = (box_hull(bb) if m_collision == "bbox"
+                            else ramp_hull(bb, m_ramp))
+                    write_collision_smd([part], phys, scale=m_scale)
+                    coll_smd, maxc = phys, 1
+            elif big and m_collision in ("auto", "acd"):
+                if m_collision == "acd" and acd.available():
                     # isolated subprocess so a crash/timeout on a pathological mesh
                     # can't kill the build. On failure, retry once at a coarser
                     # threshold (fast; keeps walk-in collision), else fall back to a
@@ -909,24 +1038,24 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                         parts = _acd(ACD_COARSE_THRESHOLD, ACD_TIMEOUT)
                         coarse = bool(parts)
                     if parts:
-                        write_collision_smd(parts, phys, scale=scale)
+                        write_collision_smd(parts, phys, scale=m_scale)
                         coll_smd, maxc = phys, max(64, len(parts) + 8)
                         res["logs"].append("    acd %s -> %d hulls%s%s" % (
                             slug, len(parts), " (havok)" if coll_subs is not subs else "",
                             " (coarse)" if coarse else ""))
                     else:
                         # last resort: solid concave-by-component (not walk-through)
-                        write_smd(coll_subs, phys, scale=scale)
+                        write_smd(coll_subs, phys, scale=m_scale)
                         coll_smd = phys
                         res["logs"].append("[warn] ACD failed for %s -> solid "
                                            "(no walk-in, but not ghost)" % slug)
                 # big auto -> non-solid (None)
             else:
                 # small props (any mode) or 'full' (any size): concave-by-component
-                write_smd(coll_subs, phys, scale=scale)
+                write_smd(coll_subs, phys, scale=m_scale)
                 coll_smd = phys
             write_qc(qc, "%s/%s.mdl" % (prefix, slug), ref_smd, scale=1.0,
-                     collision_smd=coll_smd, max_convex=maxc, lods=lods)
+                     surfaceprop=m_surf, collision_smd=coll_smd, max_convex=maxc, lods=lods)
             if compile_models:
                 ok, clog = run_studiomdl(studiomdl, gamedir, qc)
                 if not ok:
@@ -937,7 +1066,7 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             res["model_path"] = model_path
             if not res["failure"] and compile_models:
                 res["cache_entry"] = {"sig": sig, "model_path": model_path,
-                                      "textures": res["textures"], "collision": collision}
+                                      "textures": res["textures"], "collision": m_collision}
                 _commit(modl, res["cache_entry"])   # flush now -> kill-safe
         except Exception as exc:
             res["failure"] = (modl, "exception: %r" % (exc,))
@@ -955,11 +1084,14 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
     else:
         with ThreadPoolExecutor(max_workers=n_jobs) as ex:
             results = list(ex.map(_build_one, mesh_modls))
-    n_cached = n_rebuilt = 0
+    n_cached = n_rebuilt = n_skipped = 0
     for res in results:                            # deterministic merge (cache already flushed per-model)
         for line in res["logs"]:
             log(line)
         needed_textures.update(res["textures"])
+        if res.get("skipped"):
+            n_skipped += 1
+            continue
         if res["failure"]:
             failures.append(res["failure"])
         if res["model_path"]:
@@ -1051,6 +1183,7 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
         "textures_failed": tex_fail,
         "trees": n_trees,
         "cached": n_cached,
+        "skipped": n_skipped,
         "model_scale": model_scale,
     }
     return model_map, stats

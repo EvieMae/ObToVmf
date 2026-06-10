@@ -808,10 +808,15 @@ def write_vmf(cells, out_path, scale=1.0, power=4, thickness=16.0,
 def write_interior_vmf(out_path, placements, model_map, scale=1.0, lights=None,
                        light_bases=None, ambient=None, margin=768.0,
                        angle_sign=-1.0, yaw_offset=-90.0, model_scale=None,
-                       skip_models=None, skyname=DEFAULT_SKY):
-    """Generate a .vmf for ONE interior cell (a room): a sealed black-walled box
-    sized to the placed geometry, the props, light entities from placed LIGH
-    references, and a player start.
+                       skip_models=None, skyname=DEFAULT_SKY, skybox_room=False):
+    """Generate a .vmf for ONE interior cell (a room): a sealed box sized to the
+    placed geometry, the props, light entities from placed LIGH references, and a
+    player start.
+
+    The room is always wrapped in six sealing brushes. By default they use
+    ``tools/toolsblack`` (a solid, light-tight enclosure). When ``skybox_room`` is
+    True the wrap uses ``tools/toolsskybox`` instead, so the enclosure renders the
+    2D sky on every face — for cells that are really open-air courtyards/exteriors.
 
     placements  : {key: [{base,pos,rot,scale}]} — every list is included.
     light_bases : LIGH FormID -> {"radius","color"} (from InteriorExtractor).
@@ -853,8 +858,9 @@ def write_interior_vmf(out_path, placements, model_map, scale=1.0, lights=None,
         (hx0, hy0 - t, hz0, hx1, hy0, hz1),          # south
         (hx0, hy1, hz0, hx1, hy1 + t, hz1),          # north
     ]
-    BLACK = "tools/toolsblack"
-    solids = [_plain_box_solid(ids, *b, BLACK, BLACK, color="40 40 40") for b in boxes]
+    wall = SKYBOX_MATERIAL if skybox_room else "tools/toolsblack"
+    wcol = "100 130 170" if skybox_room else "40 40 40"
+    solids = [_plain_box_solid(ids, *b, wall, wall, color=wcol) for b in boxes]
 
     # lights: one per placed LIGH reference (colour/radius from the base record)
     light_ents = []
@@ -902,3 +908,123 @@ def write_interior_vmf(out_path, placements, model_map, scale=1.0, lights=None,
         f.write("\n".join(parts) + "\n")
     return {"props": placed, "props_skipped": skipped, "lights": len(light_ents),
             "bounds": (hx0, hx1, hy0, hy1, hz0, hz1)}
+
+
+# --- func_instance insertion into a host map ---------------------------------
+
+import os as _os
+import re as _re
+
+_EMPTY_HOST = (_HEADER + "world\n{\n"
+               '\t"id" "1"\n\t"mapversion" "1"\n\t"classname" "worldspawn"\n'
+               '\t"skyname" "%s"\n}\n' % DEFAULT_SKY) + _FOOTER
+
+# lane width for laying instances side by side along +X (Source +/-16384 world)
+_INSTANCE_LANE = 8192.0
+_INSTANCE_MARGIN = 1024.0
+
+
+def _vmf_coord_bounds(text):
+    """Axis-aligned bounds of every brush-plane vertex in a VMF string, as
+    (minx,maxx,miny,maxy,minz,maxz), or None if the file has no brushwork."""
+    xs = ys = zs = None
+    lo = [None, None, None]
+    hi = [None, None, None]
+    for m in _re.finditer(r'"plane"\s+"([^"]+)"', text):
+        for tri in _re.findall(r'\(([^)]+)\)', m.group(1)):
+            p = tri.split()
+            if len(p) != 3:
+                continue
+            for i in range(3):
+                v = float(p[i])
+                lo[i] = v if lo[i] is None else min(lo[i], v)
+                hi[i] = v if hi[i] is None else max(hi[i], v)
+    if lo[0] is None:
+        return None
+    return (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2])
+
+
+def _vmf_max_id(text):
+    ids = [int(m.group(1)) for m in _re.finditer(r'"id"\s+"(\d+)"', text)]
+    return max(ids) if ids else 0
+
+
+def _existing_instances(text):
+    """Return the list of func_instance origins already present in the host."""
+    out = []
+    for m in _re.finditer(r'"classname"\s+"func_instance".*?(?="classname"|\Z)',
+                          text, _re.S):
+        om = _re.search(r'"origin"\s+"(-?[\d.]+) (-?[\d.]+) (-?[\d.]+)"', m.group(0))
+        if om:
+            out.append(tuple(float(x) for x in om.groups()))
+    return out
+
+
+def _auto_instance_origin(host_text, inst_bounds):
+    """Pick a free origin for a new instance: lay it in a lane just past the host's
+    existing content (and any instances already placed), aligned so its own
+    bounding box clears that edge. Returns (x, y, z)."""
+    hb = _vmf_coord_bounds(host_text)
+    host_max_x = hb[1] if hb else 0.0
+    insts = _existing_instances(host_text)
+    if insts:
+        host_max_x = max(host_max_x, max(o[0] for o in insts) + _INSTANCE_LANE)
+    if inst_bounds:
+        # shift so the room's left edge clears host_max_x by the margin
+        x = host_max_x + _INSTANCE_MARGIN - inst_bounds[0]
+        z = -inst_bounds[4]                          # drop floor to z=0
+    else:
+        x = host_max_x + _INSTANCE_MARGIN
+        z = 0.0
+    return (x, 0.0, z)
+
+
+def add_instance_to_vmf(host_path, instance_path, origin=None, angles=(0, 0, 0),
+                        targetname=None):
+    """Insert ``instance_path`` into ``host_path`` as a ``func_instance`` whose
+    ``file`` is stored relative to the host (forward slashes). If ``host_path``
+    doesn't exist a minimal empty host is created. When ``origin`` is None a free
+    spot is found automatically beside the host's existing content. Returns
+    ``(origin, rel_file)``."""
+    if _os.path.isfile(host_path):
+        with open(host_path, "r", encoding="ascii", errors="replace") as f:
+            text = f.read()
+    else:
+        text = _EMPTY_HOST
+
+    with open(instance_path, "r", encoding="ascii", errors="replace") as f:
+        inst_bounds = _vmf_coord_bounds(f.read())
+
+    if origin is None:
+        origin = _auto_instance_origin(text, inst_bounds)
+
+    rel = _os.path.relpath(_os.path.abspath(instance_path),
+                           _os.path.dirname(_os.path.abspath(host_path)))
+    rel = rel.replace("\\", "/")
+
+    nid = _vmf_max_id(text)
+    kv = ['entity', '{',
+          '\t"id" "%d"' % (nid + 1),
+          '\t"classname" "func_instance"',
+          '\t"angles" "%s %s %s"' % (_num(angles[0]), _num(angles[1]), _num(angles[2])),
+          '\t"file" "%s"' % rel,
+          '\t"fixup_style" "0"',
+          '\t"origin" "%s %s %s"' % (_num(origin[0]), _num(origin[1]), _num(origin[2]))]
+    if targetname:
+        kv.append('\t"targetname" "%s"' % targetname)
+    kv += ['\teditor', '{', '\t\t"color" "0 180 0"',
+           '\t\t"visgroupshown" "1"', '\t\t"visgroupautoshown" "1"', '\t}', '}']
+    ent = "\n".join(kv)
+
+    # insert before the trailing cameras/cordons footer if present, else append
+    idx = text.rfind("\ncameras")
+    if idx == -1:
+        idx = text.rfind("\ncordon")
+    if idx == -1:
+        new = text.rstrip("\n") + "\n" + ent + "\n"
+    else:
+        new = text[:idx + 1] + ent + "\n" + text[idx + 1:]
+
+    with open(host_path, "w", encoding="ascii") as f:
+        f.write(new)
+    return origin, rel
