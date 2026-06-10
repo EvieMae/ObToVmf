@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Generated maps / extracted data (never commit Bethesda-derived assets)
+*.vmf
+*.bsp
+*.esm
+*.esp
+*.bsa
+*.nif
+*.dds
+synth.*
+
+# Allow committing example/fixture vmfs intentionally if needed:
+!tests/**/*.vmf
