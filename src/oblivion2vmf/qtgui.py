@@ -123,6 +123,8 @@ class Main(QtWidgets.QMainWindow):
         self.boxes = []            # [{widget, bounds}] active hull widgets
         self.acd_actors = []       # named actors of the current ACD preview
         self.cur_model = None      # nif currently loaded in the 3D view
+        self._undo_stack = []      # pre-mutation hull snapshots (Ctrl+Z)
+        self._redo_stack = []      # undone snapshots (Ctrl+Y / Ctrl+Shift+Z)
         self.acd_ready.connect(self._on_acd_ready)
 
         central = QtWidgets.QWidget()
@@ -156,6 +158,11 @@ class Main(QtWidgets.QMainWindow):
         outer.addWidget(self.log, 1)
 
         self._apply_dark()
+
+        # hull-edit undo/redo (scoped to the 3D editor's hull state)
+        QtGui.QShortcut(QtGui.QKeySequence.Undo, self, activated=self._undo)
+        QtGui.QShortcut(QtGui.QKeySequence.Redo, self, activated=self._redo)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Y"), self, activated=self._redo)
 
     # ---- field registry helpers ----
     def _edit(self, name, default="", browse=None, width=None):
@@ -768,6 +775,8 @@ class Main(QtWidgets.QMainWindow):
 
     def _load_model_3d(self, modl):
         self.cur_model = modl
+        self._undo_stack.clear()   # undo history is per-model
+        self._redo_stack.clear()
         self._clear_boxes()
         self.acd_actors = []
         self.plotter.clear()
@@ -981,7 +990,10 @@ class Main(QtWidgets.QMainWindow):
                  "name": "hullprev_%d" % len(self.boxes)}
 
         def cb(box, widget):
-            entry["bounds"] = box.bounds
+            nb = tuple(box.bounds)
+            if nb != tuple(entry["bounds"]):   # one snapshot per completed drag
+                self._push_undo()              # entry still holds pre-drag bounds
+                entry["bounds"] = nb
             self._update_hull_preview(entry)
         w = self.plotter.add_box_widget(cb, bounds=vtk_bounds, rotation_enabled=False,
                                         pass_widget=True,
@@ -1018,6 +1030,7 @@ class Main(QtWidgets.QMainWindow):
     def _add_hull(self, shape):
         if self.plotter is None or self.cur_model is None:
             return
+        self._push_undo()
         self._spawn_box(self._default_box_bounds(), shape,
                         axis=self.wedge_axis.currentText(),
                         top_scale=float(self.trap_top.value()),
@@ -1027,6 +1040,7 @@ class Main(QtWidgets.QMainWindow):
 
     def _remove_box(self):
         if self.plotter is not None and self.boxes:
+            self._push_undo()
             gone = self.boxes.pop()                # drop the most recently added
             try:
                 self.plotter.remove_actor(gone["name"])
@@ -1037,6 +1051,7 @@ class Main(QtWidgets.QMainWindow):
 
     def _fit_box(self):
         if self.plotter is not None and self.boxes and hasattr(self, "bb"):
+            self._push_undo()
             self.boxes[-1]["bounds"] = (self.bb[0], self.bb[3], self.bb[1],
                                         self.bb[4], self.bb[2], self.bb[5])
             self._respawn_boxes()
@@ -1062,6 +1077,82 @@ class Main(QtWidgets.QMainWindow):
         for vb, t, ax, ts, sd in specs:
             self._spawn_box(vb, t, ax, ts, sides=sd)
         self.plotter.render()
+
+    # ---- hull undo/redo ----
+    def _hull_state(self):
+        """Deep, widget-free snapshot of self.boxes (only plain scalar/list data
+        survives, so snapshots stay JSON-safe and never pin VTK objects)."""
+        snap = []
+        for e in self.boxes:
+            d = {}
+            for k, v in e.items():
+                if k in ("widget", "actor", "name"):
+                    continue
+                if isinstance(v, (list, tuple)):
+                    d[k] = list(v)
+                elif isinstance(v, (str, int, float, bool)):
+                    d[k] = v
+            snap.append(d)
+        return snap
+
+    def _push_undo(self):
+        """Record the pre-mutation hull state; any new edit invalidates redo."""
+        self._undo_stack.append(self._hull_state())
+        if len(self._undo_stack) > 50:
+            del self._undo_stack[0]
+        self._redo_stack.clear()
+
+    def _restore_state(self, state):
+        """Rebuild self.boxes from a snapshot — data-only when no plotter is up."""
+        self._clear_boxes()
+        for s in state:
+            bounds = tuple(s.get("bounds", ()))
+            if self.plotter is not None:
+                self._spawn_box(bounds, s.get("type", "box"), s.get("axis", "+x"),
+                                s.get("top_scale", 0.5), sides=s.get("sides", 12))
+            else:
+                e = dict(s)
+                e["bounds"] = bounds
+                e.setdefault("type", "box")
+                e.setdefault("axis", "+x")
+                e.setdefault("top_scale", 0.5)
+                e["widget"] = None
+                e["name"] = "hullprev_%d" % len(self.boxes)
+                self.boxes.append(e)
+        if self.plotter is not None:
+            self.plotter.render()
+        self._refresh_inspector()
+
+    @staticmethod
+    def _focused_text_editor():
+        """Window shortcuts outrank widget keys; hand undo/redo back to text fields."""
+        fw = QtWidgets.QApplication.focusWidget()
+        if isinstance(fw, (QtWidgets.QLineEdit, QtWidgets.QPlainTextEdit,
+                           QtWidgets.QTextEdit)):
+            return fw
+        return None
+
+    def _undo(self):
+        fw = self._focused_text_editor()
+        if fw is not None:
+            fw.undo()
+            return
+        if not self._undo_stack or self.cur_model is None:
+            return
+        self._redo_stack.append(self._hull_state())
+        self._restore_state(self._undo_stack.pop())
+        self._append("undo: %d hull(s)" % len(self.boxes))
+
+    def _redo(self):
+        fw = self._focused_text_editor()
+        if fw is not None:
+            fw.redo()
+            return
+        if not self._redo_stack or self.cur_model is None:
+            return
+        self._undo_stack.append(self._hull_state())
+        self._restore_state(self._redo_stack.pop())
+        self._append("redo: %d hull(s)" % len(self.boxes))
 
     def _commit_hulls(self):
         if self.cur_model is None:
