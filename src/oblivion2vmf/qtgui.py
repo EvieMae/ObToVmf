@@ -1098,10 +1098,12 @@ class Main(QtWidgets.QMainWindow):
             tex = self._load_texture(mat)
             if tex is not None:
                 mesh.active_texture_coordinates = np.array(g["uvs"], dtype=float)
-                self.plotter.add_mesh(mesh, texture=tex, name="m_%d" % ntex)
+                self.plotter.add_mesh(mesh, texture=tex, name="m_%d" % ntex,
+                                      reset_camera=False)
                 ntex += 1
             else:
-                self.plotter.add_mesh(mesh, color="#8d99ae", name="flat_%d" % len(all_pts))
+                self.plotter.add_mesh(mesh, color="#8d99ae", name="flat_%d" % len(all_pts),
+                                      reset_camera=False)
         verts = np.vstack(all_pts) if all_pts else np.zeros((0, 3))
         self.bb = mesh_bounds([tuple(p) for p in verts]) if len(verts) else (0, 0, 0, 64, 64, 64)
         for h in self.model_rows[modl]["hulls"]:
@@ -1267,7 +1269,8 @@ class Main(QtWidgets.QMainWindow):
                                np.asarray(all_faces, dtype=np.int64).ravel())
             mesh.cell_data["rgb"] = np.asarray(cell_rgb, dtype=np.uint8)
             self.plotter.add_mesh(mesh, scalars="rgb", rgb=True, opacity=0.5,
-                                  show_edges=True, edge_color="#0b1b3a", name="acd_0")
+                                  show_edges=True, edge_color="#0b1b3a", name="acd_0",
+                                  reset_camera=False)
             self.acd_actors = ["acd_0"]
         except Exception as e:
             self._append("(could not draw ACD preview: %r)" % e)
@@ -1574,7 +1577,8 @@ class Main(QtWidgets.QMainWindow):
             entry["actor"] = self.plotter.add_mesh(
                 mesh, name=entry["name"], opacity=0.7 if sel else 0.45,
                 show_edges=True, edge_color="#ffffff" if sel else "#0b1b3a",
-                color=self._SHAPE_COLORS.get(entry["type"], "#80cbc4"))
+                color=self._SHAPE_COLORS.get(entry["type"], "#80cbc4"),
+                reset_camera=False)
         except Exception:
             pass
 
@@ -1800,11 +1804,6 @@ class Main(QtWidgets.QMainWindow):
         if on:
             self._detach_gizmo()
             self._detach_scale_widget()
-            # Rebuild every hull's actor from its stored spec so any leftover
-            # widget transform (the move/rotate/scale gizmos write a user_matrix on
-            # the actor) is wiped — otherwise the hull can look scaled/moved when
-            # face mode takes over. _spawn_box re-creates clean actors.
-            self._respawn_boxes()
             # IMPORTANT: we do NOT use pyvista's enable_*_picking — it swaps the
             # interactor to a trackball-derived picking style. Instead we keep the
             # terrain camera and pick faces ourselves with a vtkCellPicker on a
@@ -1947,7 +1946,7 @@ class Main(QtWidgets.QMainWindow):
                 cells.extend([3, remap[f[0]], remap[f[1]], remap[f[2]]])
             actor = self.plotter.add_mesh(
                 pv.PolyData(fpts, np.asarray(cells, dtype=np.int64)),
-                color="#ffeb3b", opacity=0.9, name="face_sel")
+                color="#ffeb3b", opacity=0.9, name="face_sel", reset_camera=False)
             self._gizmo = self.plotter.add_affine_transform_widget(
                 actor, release_callback=self._on_face_gizmo_release)
             fs["actor"] = actor
