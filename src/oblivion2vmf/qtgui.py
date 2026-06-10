@@ -641,6 +641,7 @@ class Main(QtWidgets.QMainWindow):
                         ("Remove", self._remove_box),
                         ("Fit to model", self._fit_box),
                         ("Save hulls → row", self._commit_hulls),
+                        ("Import NIF collision", self._import_nif_collision),
                         ("Edit collision in Blender ⧉", self._edit_in_blender),
                         ("Import from Blender", self._import_from_blender)]:
             b = QtWidgets.QPushButton(lab)
@@ -1041,6 +1042,45 @@ class Main(QtWidgets.QMainWindow):
         self._refresh_inspector()
 
     # ---- CoACD generation / preview ----
+    def _nif_source(self):
+        """A DataSource over the configured BSAs / loose data dir, or None. Lets the
+        editor read a model's original NIF (for its Havok collision shell)."""
+        dd = self.getters["data_dir"]().strip() if "data_dir" in self.getters else ""
+        if not self.bsa_list and not dd:
+            return None
+        try:
+            from .bsa import DataSource
+            return DataSource(data_dir=(dd or None), bsa_paths=list(self.bsa_list))
+        except Exception:
+            return None
+
+    def _havok_collision_subs(self, modl):
+        """The model's authored Havok collision shell as ACD submeshes in EDITOR
+        (Hammer) units, or None. This is the collision Bethesda shipped in the .nif
+        — cleaner than the render mesh — read live from the BSA/data dir."""
+        source = self._nif_source()
+        if source is None:
+            return None
+        try:
+            from . import nif
+            data = source.get_mesh(modl)
+            if data is None:
+                return None
+            coll = nif.extract_collision(data)
+        except Exception:
+            return None
+        if not coll:
+            return None
+        try:
+            scl = float(self.getters["scale"]())
+        except (ValueError, KeyError):
+            scl = 1.0
+        out = []
+        for s in coll:
+            out.append({"verts": [[v[0] * scl, v[1] * scl, v[2] * scl] for v in s["verts"]],
+                        "tris": [list(t) for t in s["tris"]]})
+        return out
+
     def _generate_acd(self):
         if self.plotter is None or self.cur_model is None:
             self._append("Load a model row first.")
@@ -1049,16 +1089,24 @@ class Main(QtWidgets.QMainWindow):
         if not acd.available():
             self._append("CoACD not installed — run: pip install coacd")
             return
-        smd = os.path.join(self._work_dir(), slugify(self.cur_model) + ".smd")
-        verts, tris = read_smd_mesh(smd)
-        if not tris:
-            self._append("No mesh geometry to decompose.")
-            return
-        thr = float(self.acd_thresh.value())
         modl = self.cur_model
+        # Prefer the NIF's authored Havok collision shell (what the build uses for
+        # --collision acd, and what gives clean walk-in interiors); fall back to the
+        # render SMD when no BSA/data dir is set.
+        subs = self._havok_collision_subs(modl)
+        src = "Havok shell"
+        if not subs:
+            smd = os.path.join(self._work_dir(), slugify(modl) + ".smd")
+            verts, tris = read_smd_mesh(smd)
+            if not tris:
+                self._append("No mesh geometry to decompose.")
+                return
+            subs = [{"verts": verts, "tris": tris}]
+            src = "render mesh"
+        thr = float(self.acd_thresh.value())
         self.acd_btn.setEnabled(False)
-        self._append("Generating ACD for %s (threshold %.2f)…" % (os.path.basename(modl), thr))
-        subs = [{"verts": verts, "tris": tris}]
+        self._append("Generating ACD for %s from the %s (threshold %.2f)…"
+                     % (os.path.basename(modl), src, thr))
 
         def work():
             try:
@@ -2056,6 +2104,49 @@ class Main(QtWidgets.QMainWindow):
         if hulls:
             self.model_rows[self.cur_model]["collision"].setCurrentText("hulls")
         self._append("%s: %d hull(s) set (now Save overrides)." % (self.cur_model, len(hulls)))
+
+    def _import_nif_collision(self):
+        """Pull the model's authored Havok collision shell straight from the .nif
+        into the row as mesh hull(s). One concave shell = one convex piece at build
+        time, so for a walk-in interior follow this with Generate ACD (or just use
+        Generate ACD, which now reads the same shell)."""
+        modl = self.cur_model or self._selected_model()
+        if not modl:
+            self._append("Select a model row first.")
+            return
+        if self._nif_source() is None:
+            self._append("Add the Meshes BSA (or a loose Data dir) on the Input tab "
+                         "first — the NIF collision is read from there.")
+            return
+        subs = self._havok_collision_subs(modl)
+        if not subs:
+            self._append("%s has no Havok collision in its .nif (or the NIF wasn't "
+                         "found in your BSA/data dir)." % os.path.basename(modl))
+            return
+        row = self.model_rows.get(modl)
+        if row is None:
+            self._append("Model %s is not in the table; re-scan." % modl)
+            return
+        hulls = []
+        for s in subs:
+            verts, tris = s["verts"], s["tris"]
+            if len(verts) >= 4 and tris:
+                hulls.append({"type": "mesh",
+                              "verts": [[round(float(c), 3) for c in v] for v in verts],
+                              "faces": [[int(i) for i in t] for t in tris]})
+        if not hulls:
+            self._append("Havok collision had no usable geometry.")
+            return
+        row["hulls"] = hulls
+        row["collision"].setCurrentText("hulls")
+        ntri = sum(len(h["faces"]) for h in hulls)
+        self._append("Imported NIF Havok collision for %s: %d piece(s), %d tri(s). "
+                     "For a walk-in interior, run Generate ACD to split it into convex "
+                     "pieces. Save overrides to keep it."
+                     % (os.path.basename(modl), len(hulls), ntri))
+        if modl == self.cur_model and self.plotter is not None:
+            self.cur_model = None
+            self._load_model_3d(modl)
 
     # ---- Blender collision round-trip ----
     def _blender_paths(self, modl):
