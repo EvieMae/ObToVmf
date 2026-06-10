@@ -98,6 +98,80 @@ def _terrain_args(v, plugins, bsas):
     return a
 
 
+class FlowLayout(QtWidgets.QLayout):
+    """A left-to-right layout that wraps its widgets onto new rows when they don't
+    fit the available width (Qt has no built-in flow layout). Used for the editor's
+    long button/control rows so they reflow instead of overflowing."""
+
+    def __init__(self, parent=None, spacing=4):
+        super().__init__(parent)
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(spacing)
+        self._items = []
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do(QtCore.QRect(0, 0, width, 0), test=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do(rect, test=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        s = QtCore.QSize()
+        for it in self._items:
+            s = s.expandedTo(it.minimumSize())
+        return s
+
+    def _do(self, rect, test):
+        x, y, line_h = rect.x(), rect.y(), 0
+        sp = self.spacing()
+        for it in self._items:
+            w, h = it.sizeHint().width(), it.sizeHint().height()
+            if x + w > rect.right() and line_h > 0:
+                x = rect.x()
+                y += line_h + sp
+                line_h = 0
+            if not test:
+                it.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), it.sizeHint()))
+            x += w + sp
+            line_h = max(line_h, h)
+        return y + line_h - rect.y()
+
+
+def _flow_row(items):
+    """A container widget whose children flow/wrap. ``items`` is a list of widgets;
+    returns the container (its heightForWidth is honoured by a parent VBox)."""
+    host = QtWidgets.QWidget()
+    fl = FlowLayout(host)
+    for w in items:
+        fl.addWidget(w)
+    sp = host.sizePolicy()
+    sp.setHeightForWidth(True)
+    host.setSizePolicy(sp)
+    return host
+
+
 def _find_blender():
     """Best-effort blender.exe path: PATH, then the usual Windows install dirs."""
     import glob
@@ -632,7 +706,7 @@ class Main(QtWidgets.QMainWindow):
         else:
             rv.addWidget(QtWidgets.QLabel("pyvista not available:\n%r" % (_IMPORT_ERR,)))
 
-        hb = QtWidgets.QHBoxLayout()
+        hull_btns = []
         for lab, fn in [("Add box", lambda: self._add_hull("box")),
                         ("Add wedge", lambda: self._add_hull("wedge")),
                         ("Add trapezium", lambda: self._add_hull("trap")),
@@ -647,41 +721,32 @@ class Main(QtWidgets.QMainWindow):
                         ("Import from Blender", self._import_from_blender)]:
             b = QtWidgets.QPushButton(lab)
             b.clicked.connect(fn)
-            hb.addWidget(b)
-        rv.addLayout(hb)
+            hull_btns.append(b)
+        rv.addWidget(_flow_row(hull_btns))
 
-        sb = QtWidgets.QHBoxLayout()
-        sb.addWidget(QtWidgets.QLabel("Wedge rise axis"))
         self.wedge_axis = QtWidgets.QComboBox()
         self.wedge_axis.addItems(["+x", "-x", "+y", "-y"])
-        sb.addWidget(self.wedge_axis)
-        sb.addWidget(QtWidgets.QLabel("Trapezium top scale"))
         self.trap_top = QtWidgets.QDoubleSpinBox()
         self.trap_top.setRange(0.05, 1.0)
         self.trap_top.setSingleStep(0.05)
         self.trap_top.setValue(0.5)
-        sb.addWidget(self.trap_top)
-        sb.addWidget(QtWidgets.QLabel("Cylinder sides"))
         self.cyl_sides = QtWidgets.QComboBox()
         self.cyl_sides.addItems(["8", "12", "16"])
         self.cyl_sides.setCurrentText("12")
-        sb.addWidget(self.cyl_sides)
-        # CoACD convex-decomposition controls share the row
-        sb.addWidget(QtWidgets.QLabel("ACD"))
         self.acd_thresh = QtWidgets.QDoubleSpinBox()
         self.acd_thresh.setRange(0.01, 1.0)
         self.acd_thresh.setSingleStep(0.01)
         self.acd_thresh.setDecimals(2)
         self.acd_thresh.setValue(float(self.cfg.get("acd_threshold", 0.08) or 0.08))
-        sb.addWidget(self.acd_thresh)
         self.acd_btn = QtWidgets.QPushButton("Generate ACD")
         self.acd_btn.clicked.connect(self._generate_acd)
-        sb.addWidget(self.acd_btn)
         self.acd_clear_btn = QtWidgets.QPushButton("Clear ACD")
         self.acd_clear_btn.clicked.connect(self._clear_acd)
-        sb.addWidget(self.acd_clear_btn)
-        sb.addStretch(1)
-        rv.addLayout(sb)
+        rv.addWidget(_flow_row([
+            QtWidgets.QLabel("Wedge rise axis"), self.wedge_axis,
+            QtWidgets.QLabel("Trapezium top scale"), self.trap_top,
+            QtWidgets.QLabel("Cylinder sides"), self.cyl_sides,
+            QtWidgets.QLabel("ACD"), self.acd_thresh, self.acd_btn, self.acd_clear_btn]))
 
         self.hull_info = QtWidgets.QLabel("Select a model row to load it. Drag the gizmo "
                                           "arrows/rings to move/rotate; use Transform for "
