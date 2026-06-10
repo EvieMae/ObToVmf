@@ -515,9 +515,7 @@ class Main(QtWidgets.QMainWindow):
                 self.plotter = QtInteractor(view)
                 rv.addWidget(self.plotter.interactor, 1)
                 self._style_viewport()
-                # terrain interaction: orbit = azimuth + elevation only (the camera
-                # can never roll), wheel zooms, shift pans
-                self.plotter.enable_terrain_style(mouse_wheel_zooms=True, shift_pans=True)
+                self._apply_camera_style()
             except Exception as e:                       # missing/old GL drivers, etc.
                 rv.addWidget(QtWidgets.QLabel(
                     "3D viewport failed to initialise (OpenGL?):\n%r\n\n"
@@ -1058,11 +1056,24 @@ class Main(QtWidgets.QMainWindow):
     def _from_vtk_bounds(vb):
         return [vb[0], vb[2], vb[4], vb[1], vb[3], vb[5]]
 
+    def _apply_camera_style(self):
+        """Terrain interaction: the camera orbits in exactly TWO degrees of freedom
+        (azimuth + elevation) and can never roll. VTK's picking enable/disable swaps
+        the interactor style back to the free trackball, so this is re-applied after
+        every picking change, not just at startup."""
+        if self.plotter is None:
+            return
+        try:
+            self.plotter.enable_terrain_style(mouse_wheel_zooms=True, shift_pans=True)
+        except Exception:
+            pass
+
     def _snap_view(self, which):
         if self.plotter is None:
             return
         {"xy": self.plotter.view_xy, "xz": self.plotter.view_xz,
          "yz": self.plotter.view_yz, "iso": self.plotter.view_isometric}[which]()
+        self._apply_camera_style()
         self.plotter.render()
 
     _SHAPE_COLORS = {"box": "#46c0ff", "wedge": "#ffd54f", "trap": "#80cbc4",
@@ -1325,12 +1336,14 @@ class Main(QtWidgets.QMainWindow):
                 self._append("face picking unavailable: %r" % exc)
                 self.face_btn.setChecked(False)
                 return
+            self._apply_camera_style()            # picking resets the interactor style
             self._append("Face mode: click a face on the selected hull.")
         else:
             try:
                 self.plotter.disable_picking()
             except Exception:
                 pass
+            self._apply_camera_style()            # ditto on the way out
             self._clear_face_sel()
             if self._selected_hull is not None:   # bring the gizmo back
                 self._select_hull(self._selected_hull)
