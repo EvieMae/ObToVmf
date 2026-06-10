@@ -98,6 +98,93 @@ def _terrain_args(v, plugins, bsas):
     return a
 
 
+def _find_blender():
+    """Best-effort blender.exe path: PATH, then the usual Windows install dirs."""
+    import glob
+    import shutil
+    found = shutil.which("blender")
+    if found:
+        return found
+    pats = [r"C:\Program Files\Blender Foundation\Blender*\blender.exe",
+            r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe"]
+    hits = sorted(p for pat in pats for p in glob.glob(pat))
+    return hits[-1] if hits else ""
+
+
+# Bootstrap run inside Blender (`blender --python this -- ref.obj out.json`): loads
+# the prop as a locked wireframe reference, then exposes a sidebar panel whose
+# button writes every OTHER mesh object back as a list of {verts, faces} (world
+# space) — each object becomes one convex collision piece for oblivion2vmf.
+_BLENDER_BOOTSTRAP = r'''
+import bpy, json, sys, os
+
+argv = sys.argv[sys.argv.index("--") + 1:]
+REF_OBJ, OUT_JSON = argv[0], argv[1]
+
+bpy.ops.wm.read_factory_settings(use_empty=True)
+try:
+    bpy.ops.wm.obj_import(filepath=REF_OBJ)        # Blender 4.x
+except Exception:
+    bpy.ops.import_scene.obj(filepath=REF_OBJ)     # Blender 3.x
+for o in list(bpy.context.selected_objects):
+    o.name = "reference"
+    o.display_type = "WIRE"
+    o.hide_select = True                           # don't edit the reference itself
+
+
+def _triangulate(poly_verts):
+    return [(poly_verts[0], poly_verts[i], poly_verts[i + 1])
+            for i in range(1, len(poly_verts) - 1)]
+
+
+class OBLIVION2VMF_OT_save(bpy.types.Operator):
+    bl_idname = "oblivion2vmf.save_collision"
+    bl_label = "Save collision -> oblivion2vmf"
+    bl_description = "Write every non-reference mesh as a convex collision piece"
+
+    def execute(self, context):
+        hulls = []
+        for o in bpy.data.objects:
+            if o.type != "MESH" or o.name.startswith("reference"):
+                continue
+            me = o.to_mesh()
+            mw = o.matrix_world
+            verts = [list(mw @ v.co) for v in me.vertices]
+            faces = []
+            for p in me.polygons:
+                faces.extend(_triangulate(list(p.vertices)))
+            o.to_mesh_clear()
+            if len(verts) >= 4 and faces:
+                hulls.append({"verts": verts, "faces": [list(f) for f in faces]})
+        with open(OUT_JSON, "w") as f:
+            json.dump(hulls, f)
+        self.report({"INFO"}, "Saved %d collision piece(s) -> %s"
+                    % (len(hulls), OUT_JSON))
+        return {"FINISHED"}
+
+
+class OBLIVION2VMF_PT_panel(bpy.types.Panel):
+    bl_label = "oblivion2vmf"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "oblivion2vmf"
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.label(text="Build CONVEX pieces (one")
+        col.label(text="object each) over the wire")
+        col.label(text="reference, then:")
+        col.operator("oblivion2vmf.save_collision", icon="EXPORT")
+
+
+for _c in (OBLIVION2VMF_OT_save, OBLIVION2VMF_PT_panel):
+    try:
+        bpy.utils.register_class(_c)
+    except Exception:
+        pass
+'''
+
+
 # --------------------------------------------------------------------------- #
 #  rotation helpers (XYZ euler degrees <-> 3x3 matrices) for the hull gizmo   #
 # --------------------------------------------------------------------------- #
@@ -352,6 +439,8 @@ class Main(QtWidgets.QMainWindow):
         g.addRow("Yaw offset (deg)", self._edit("yaw_offset", "-90"))
         g.addRow("studiomdl.exe", self._edit("studiomdl", browse="open"))
         g.addRow("GMod garrysmod dir", self._edit("gamedir", browse="dir"))
+        g.addRow("blender.exe (collision editor)",
+                 self._edit("blender", str(_find_blender()), browse="open"))
 
     def _tab_trees(self):
         f = QtWidgets.QWidget()
@@ -551,7 +640,9 @@ class Main(QtWidgets.QMainWindow):
                         ("Add plane", lambda: self._add_hull("plane")),
                         ("Remove", self._remove_box),
                         ("Fit to model", self._fit_box),
-                        ("Save hulls → row", self._commit_hulls)]:
+                        ("Save hulls → row", self._commit_hulls),
+                        ("Edit collision in Blender ⧉", self._edit_in_blender),
+                        ("Import from Blender", self._import_from_blender)]:
             b = QtWidgets.QPushButton(lab)
             b.clicked.connect(fn)
             hb.addWidget(b)
@@ -1949,6 +2040,126 @@ class Main(QtWidgets.QMainWindow):
         if hulls:
             self.model_rows[self.cur_model]["collision"].setCurrentText("hulls")
         self._append("%s: %d hull(s) set (now Save overrides)." % (self.cur_model, len(hulls)))
+
+    # ---- Blender collision round-trip ----
+    def _blender_paths(self, modl):
+        wd = self._work_dir()
+        slug = slugify(modl)
+        return (os.path.join(wd, slug + "_ref.obj"),
+                os.path.join(wd, "_blender_bootstrap.py"),
+                os.path.join(wd, slug + "_collision.json"))
+
+    def _edit_in_blender(self):
+        """Open the selected model's mesh in Blender (as a locked wireframe) so the
+        user can model convex collision pieces; auto-imports them on save."""
+        modl = self.cur_model or self._selected_model()
+        if not modl:
+            self._append("Select a model row first.")
+            return
+        blender = self.getters["blender"]().strip() if "blender" in self.getters else ""
+        if not blender or not os.path.isfile(blender):
+            self._append("Set blender.exe on the Models tab first (auto-detect failed).")
+            return
+        smd = os.path.join(self._work_dir(), slugify(modl) + ".smd")
+        verts, tris = read_smd_mesh(smd)
+        if not tris:
+            self._append("No compiled SMD mesh for %s — build it first." % modl)
+            return
+        ref_obj, boot, out_json = self._blender_paths(modl)
+        try:
+            self._write_obj(ref_obj, verts, tris)
+            with open(boot, "w", encoding="utf-8") as f:
+                f.write(_BLENDER_BOOTSTRAP)
+            if os.path.isfile(out_json):
+                os.remove(out_json)               # so the watcher sees a fresh write
+        except Exception as e:
+            self._append("could not stage Blender files: %r" % e)
+            return
+        proc = QProcess(self)
+        proc.setProcessEnvironment(self._env())
+        proc.start(blender, ["--python", boot, "--", ref_obj, out_json])
+        self._blender_proc = proc
+        # auto-import whenever Blender (re)writes the collision JSON, so iterating
+        # in Blender + clicking Save repeatedly keeps updating the editor
+        self._blender_target = (modl, out_json)
+        self._blender_mtime = 0.0
+        watcher = QtCore.QFileSystemWatcher(self)
+        watcher.addPath(self._work_dir())
+        watcher.directoryChanged.connect(self._blender_dir_changed)
+        self._blender_watcher = watcher
+        self._append("Blender launched for %s. In its 'oblivion2vmf' sidebar panel "
+                     "(press N), build convex pieces and click 'Save collision'."
+                     % os.path.basename(modl))
+
+    def _blender_dir_changed(self, _path):
+        tgt = getattr(self, "_blender_target", None)
+        if not tgt or not os.path.isfile(tgt[1]):
+            return
+        try:
+            mt = os.path.getmtime(tgt[1])
+        except OSError:
+            return
+        if mt <= getattr(self, "_blender_mtime", 0.0):
+            return                                 # unchanged (other dir activity)
+        self._blender_mtime = mt
+        self._import_blender_json(tgt[0], tgt[1], auto=True)
+
+    def _import_from_blender(self):
+        """Manual fallback: read the collision JSON for the selected model."""
+        modl = self.cur_model or self._selected_model()
+        if not modl:
+            self._append("Select a model row first.")
+            return
+        _ref, _boot, out_json = self._blender_paths(modl)
+        if not os.path.isfile(out_json):
+            out_json, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Blender collision JSON", self._work_dir(), "JSON (*.json)")
+            if not out_json:
+                return
+        self._import_blender_json(modl, out_json, auto=False)
+
+    def _import_blender_json(self, modl, out_json, auto):
+        try:
+            with open(out_json, encoding="utf-8") as f:
+                pieces = json.load(f)
+        except Exception as e:
+            self._append("could not read Blender collision: %r" % e)
+            return
+        hulls = []
+        for p in pieces:
+            verts = p.get("verts") or []
+            faces = p.get("faces") or []
+            if len(verts) >= 4 and faces:
+                hulls.append({"type": "mesh",
+                              "verts": [[round(float(c), 3) for c in v] for v in verts],
+                              "faces": [[int(i) for i in f] for f in faces]})
+        if not hulls:
+            self._append("Blender collision had no usable pieces "
+                         "(build CONVEX mesh objects, not just the reference).")
+            return
+        row = self.model_rows.get(modl)
+        if row is None:
+            self._append("Model %s is no longer in the table; re-scan." % modl)
+            return
+        row["hulls"] = hulls
+        row["collision"].setCurrentText("hulls")
+        self._append("%sImported %d collision piece(s) from Blender for %s. Save "
+                     "overrides to keep them." % ("[auto] " if auto else "",
+                                                  len(hulls), os.path.basename(modl)))
+        if modl == self.cur_model and self.plotter is not None:
+            self.cur_model = None                 # force a fresh reload of the hulls
+            self._load_model_3d(modl)
+
+    @staticmethod
+    def _write_obj(path, verts, tris):
+        """Write a render mesh to a Wavefront OBJ for Blender (1-based indices)."""
+        lines = ["# oblivion2vmf collision reference"]
+        for x, y, z in verts:
+            lines.append("v %.6f %.6f %.6f" % (x, y, z))
+        for a, b, c in tris:
+            lines.append("f %d %d %d" % (a + 1, b + 1, c + 1))
+        with open(path, "w", encoding="ascii") as f:
+            f.write("\n".join(lines) + "\n")
 
     # ---- overrides persistence ----
     def _overrides_from_rows(self):
