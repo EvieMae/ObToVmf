@@ -12,6 +12,7 @@ aren't installed.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sys
@@ -190,37 +191,20 @@ def _find_blender():
 # button writes every OTHER mesh object back as a list of {verts, faces} (world
 # space) — each object becomes one convex collision piece for oblivion2vmf.
 _BLENDER_BOOTSTRAP = r'''
-import bpy, json, sys, os
+import bpy, json, sys, os, traceback
 
 argv = sys.argv[sys.argv.index("--") + 1:]
 REF_OBJ, OUT_JSON = argv[0], argv[1]
-
-bpy.ops.wm.read_factory_settings(use_empty=True)
-# IDENTITY axes: Blender's default OBJ conversion (-Z forward / Y up) re-maps the
-# coordinates on import (a -90 X rotation), but our save-back reads raw world
-# coords — the round trip would come back rotated. Blender's own convention is
-# forward=-Y / up=Z, so declaring the FILE as NEGATIVE_Y/Z makes the conversion
-# the identity: the model imports in our exact Z-up coordinates.
-try:
-    bpy.ops.wm.obj_import(filepath=REF_OBJ,        # Blender 4.x
-                          forward_axis='NEGATIVE_Y', up_axis='Z')
-except Exception:
-    bpy.ops.import_scene.obj(filepath=REF_OBJ,     # Blender 3.x
-                             axis_forward='-Y', axis_up='Z')
-for o in list(bpy.context.selected_objects):
-    o.name = "reference"
-    o.display_type = "WIRE"
-    o.hide_select = True                           # don't edit the reference itself
+STATUS = {"msg": "Build CONVEX pieces (one object each), then Save."}
 
 
-def _triangulate(poly_verts):
-    return [(poly_verts[0], poly_verts[i], poly_verts[i + 1])
-            for i in range(1, len(poly_verts) - 1)]
+def _triangulate(pv):
+    return [(pv[0], pv[i], pv[i + 1]) for i in range(1, len(pv) - 1)]
 
 
 class OBLIVION2VMF_OT_save(bpy.types.Operator):
     bl_idname = "oblivion2vmf.save_collision"
-    bl_label = "Save collision -> oblivion2vmf"
+    bl_label = "Save collision to oblivion2vmf"
     bl_description = "Write every non-reference mesh as a convex collision piece"
 
     def execute(self, context):
@@ -239,30 +223,63 @@ class OBLIVION2VMF_OT_save(bpy.types.Operator):
                 hulls.append({"verts": verts, "faces": [list(f) for f in faces]})
         with open(OUT_JSON, "w") as f:
             json.dump(hulls, f)
+        STATUS["msg"] = "Saved %d piece(s)." % len(hulls)
         self.report({"INFO"}, "Saved %d collision piece(s) -> %s"
                     % (len(hulls), OUT_JSON))
         return {"FINISHED"}
 
 
 class OBLIVION2VMF_PT_panel(bpy.types.Panel):
-    bl_label = "oblivion2vmf"
+    bl_label = "oblivion2vmf collision"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "oblivion2vmf"
 
     def draw(self, context):
         col = self.layout.column()
-        col.label(text="Build CONVEX pieces (one")
-        col.label(text="object each) over the wire")
-        col.label(text="reference, then:")
         col.operator("oblivion2vmf.save_collision", icon="EXPORT")
+        col.separator()
+        for line in STATUS["msg"].split("\n"):
+            col.label(text=line, icon="INFO")
 
 
+# Register the panel/operator FIRST and unconditionally, so the sidebar tab always
+# appears even if the reference import fails. (Importing first and letting an
+# exception abort the script is why the panel was missing on some Blender builds.)
+try:
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+except Exception:
+    pass
 for _c in (OBLIVION2VMF_OT_save, OBLIVION2VMF_PT_panel):
     try:
         bpy.utils.register_class(_c)
     except Exception:
-        pass
+        traceback.print_exc()
+
+# Now import the reference as a locked wireframe — guarded so a failure can never
+# remove the panel. Identity axes (forward=-Y, up=Z) so the round trip isn't rotated.
+try:
+    if hasattr(bpy.ops.wm, "obj_import"):          # Blender 4.x
+        bpy.ops.wm.obj_import(filepath=REF_OBJ, forward_axis='NEGATIVE_Y', up_axis='Z')
+    else:                                          # Blender 3.x
+        bpy.ops.import_scene.obj(filepath=REF_OBJ, axis_forward='-Y', axis_up='Z')
+    for o in list(bpy.context.selected_objects):
+        o.name = "reference"
+        o.display_type = "WIRE"
+        o.hide_select = True
+except Exception as exc:
+    STATUS["msg"] = "Reference import FAILED:\n%s\nBuild collision anyway." % exc
+    traceback.print_exc()
+
+# Pop the N sidebar open so the panel is visible without the user pressing N.
+try:
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            for space in area.spaces:
+                if space.type == 'VIEW_3D':
+                    space.show_region_ui = True
+except Exception:
+    pass
 '''
 
 
@@ -965,35 +982,48 @@ class Main(QtWidgets.QMainWindow):
         self._fill_table(models, "scan")
 
     def _load_compiled(self):
-        from .model import load_json_tolerant
+        from .model import load_json_tolerant, slugify
         cache = os.path.join(self._work_dir(), ".build_cache.json")
-        if not os.path.isfile(cache):
-            self._append("No build cache at %s — compile a build first." % cache)
-            return
-        strict = None
-        try:
-            with open(cache, encoding="utf-8") as fh:
-                strict = json.load(fh)
-        except ValueError:
-            strict = None                          # truncated/corrupt -> salvage below
-        # load_json_tolerant keeps every complete entry, dropping any partial tail
-        data = strict if strict is not None else load_json_tolerant(cache)
-        if not data:
-            self._append("Build cache at %s is unreadable/empty — try 'Scan models', "
-                         "or rebuild it: python -m oblivion2vmf --rebuild-cache "
-                         "(with the same model flags you build with)." % cache)
-            return
-        if strict is None:                         # repair the file on disk in place
-            from .model import atomic_write_json
+        strict, data = None, {}
+        if os.path.isfile(cache):
             try:
-                atomic_write_json(cache, data)
-                self._append("Repaired corrupt build cache (%d entries kept)." % len(data))
-            except Exception:
-                pass
-        # load EVERY compiled model; the search box live-filters the table afterwards
-        models = [(m, 0) for m in sorted(data)]
-        self._fill_table(models, "compiled" if strict is not None
-                         else "compiled, SALVAGED corrupt cache")
+                with open(cache, encoding="utf-8") as fh:
+                    strict = json.load(fh)
+            except ValueError:
+                strict = None                      # truncated/corrupt -> salvage below
+            data = strict if strict is not None else load_json_tolerant(cache)
+            if strict is None and data:            # repair the file on disk in place
+                from .model import atomic_write_json
+                try:
+                    atomic_write_json(cache, data)
+                    self._append("Repaired corrupt build cache (%d entries kept)." % len(data))
+                except Exception:
+                    pass
+        # Union: cached models + every model with an override entry (hull/configured
+        # models that were marked dirty are dropped from the cache, but you still
+        # want to find them) + any compiled .mdl SMD still in models_src.
+        keys = {}                                  # slug -> display path (cache wins)
+        for m in data:
+            keys[slugify(m)] = m
+        for m in self._read_overrides_file():
+            keys.setdefault(slugify(m), m)
+        import re as _re
+        for smd in (glob.glob(os.path.join(self._work_dir(), "*.smd")) or []):
+            s = os.path.splitext(os.path.basename(smd))[0]
+            # skip generated variants: collision (_phys), body splits (_bN),
+            # LODs (_lodN), the OBJ reference (_ref)
+            if _re.search(r"_(phys|ref|b\d+|lod\d+)$", s):
+                continue
+            keys.setdefault(s, s)                  # slug-only (no nif path known)
+        if not keys:
+            self._append("Nothing to load — no build cache, overrides, or compiled "
+                         "model sources in %s. Run a build or Scan models." % self._work_dir())
+            return
+        models = [(p, 0) for _s, p in sorted(keys.items())]
+        tag = "compiled+overrides (%d cached, %d total)" % (len(data), len(models))
+        if strict is None and data:
+            tag = "SALVAGED cache; " + tag
+        self._fill_table(models, tag)
 
     def _work_dir(self):
         out_dir = os.path.dirname(os.path.abspath(self.getters["out"]())) or "."
