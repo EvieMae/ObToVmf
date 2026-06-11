@@ -214,31 +214,50 @@ def _find_blender():
     return pf[-1] if pf else ""
 
 
-# Bootstrap run inside Blender (`blender --python this -- ref.obj out.json`): loads
-# the prop as a locked wireframe reference, then exposes a sidebar panel whose
-# button writes every OTHER mesh object back as a list of {verts, faces} (world
-# space) — each object becomes one convex collision piece for oblivion2vmf.
+# Bootstrap run inside Blender (`blender --python this -- ref.obj out.json`). Two
+# collections: 'reference' (the imported prop, locked wireframe, NEVER exported)
+# and 'collision' (the active one — every mesh you put here becomes one convex
+# piece). The model is import-reference ONLY; collision is grouped so you can move
+# it as one to fix an import offset, clear a bad import without losing collision,
+# and Ctrl+D / Ctrl+C / Ctrl+V land new pieces in the collision group.
 _BLENDER_BOOTSTRAP = r'''
 import bpy, json, sys, os, traceback
 
 argv = sys.argv[sys.argv.index("--") + 1:]
 REF_OBJ, OUT_JSON = argv[0], argv[1]
-STATUS = {"msg": "Build CONVEX pieces (one object each), then Save."}
+STATUS = {"msg": "Build CONVEX pieces in the 'collision' group, then Save."}
+REF_COLL, COLL_COLL = "reference", "collision"
 
 
 def _triangulate(pv):
     return [(pv[0], pv[i], pv[i + 1]) for i in range(1, len(pv) - 1)]
 
 
+def _get_coll(name):
+    c = bpy.data.collections.get(name)
+    if c is None:
+        c = bpy.data.collections.new(name)
+        bpy.context.scene.collection.children.link(c)
+    return c
+
+
+def _activate(name):
+    lc = bpy.context.view_layer.layer_collection.children.get(name)
+    if lc is not None:
+        bpy.context.view_layer.active_layer_collection = lc
+
+
 class OBLIVION2VMF_OT_save(bpy.types.Operator):
     bl_idname = "oblivion2vmf.save_collision"
     bl_label = "Save collision to oblivion2vmf"
-    bl_description = "Write every non-reference mesh as a convex collision piece"
+    bl_description = "Write every mesh in the 'collision' group as a convex piece"
 
     def execute(self, context):
+        coll = bpy.data.collections.get(COLL_COLL)
+        objs = list(coll.all_objects) if coll else []
         hulls = []
-        for o in bpy.data.objects:
-            if o.type != "MESH" or o.name.startswith("reference"):
+        for o in objs:
+            if o.type != "MESH":
                 continue
             me = o.to_mesh()
             mw = o.matrix_world
@@ -251,9 +270,56 @@ class OBLIVION2VMF_OT_save(bpy.types.Operator):
                 hulls.append({"verts": verts, "faces": [list(f) for f in faces]})
         with open(OUT_JSON, "w") as f:
             json.dump(hulls, f)
-        STATUS["msg"] = "Saved %d piece(s)." % len(hulls)
+        STATUS["msg"] = "Saved %d piece(s) from the collision group." % len(hulls)
         self.report({"INFO"}, "Saved %d collision piece(s) -> %s"
                     % (len(hulls), OUT_JSON))
+        return {"FINISHED"}
+
+
+class OBLIVION2VMF_OT_clear_import(bpy.types.Operator):
+    bl_idname = "oblivion2vmf.clear_import"
+    bl_label = "Clear imported reference"
+    bl_description = "Delete the imported reference model (e.g. a bad/offset import). "\
+                     "Your collision pieces are in a separate group and are kept."
+
+    def execute(self, context):
+        ref = bpy.data.collections.get(REF_COLL)
+        n = 0
+        if ref:
+            for o in list(ref.all_objects):
+                bpy.data.objects.remove(o, do_unlink=True)
+                n += 1
+        STATUS["msg"] = "Cleared %d reference object(s)." % n
+        self.report({"INFO"}, STATUS["msg"])
+        return {"FINISHED"}
+
+
+class OBLIVION2VMF_OT_add_box(bpy.types.Operator):
+    bl_idname = "oblivion2vmf.add_box"
+    bl_label = "Add collision box"
+    bl_description = "Add a cube to the collision group as a starting piece"
+
+    def execute(self, context):
+        _activate(COLL_COLL)
+        bpy.ops.mesh.primitive_cube_add(size=16)
+        return {"FINISHED"}
+
+
+class OBLIVION2VMF_OT_select(bpy.types.Operator):
+    bl_idname = "oblivion2vmf.select_collision"
+    bl_label = "Select whole collision group"
+    bl_description = "Select every collision piece so you can move/rotate it as one "\
+                     "(then press G / R) to fix an import offset"
+
+    def execute(self, context):
+        bpy.ops.object.select_all(action='DESELECT')
+        coll = bpy.data.collections.get(COLL_COLL)
+        last = None
+        for o in (coll.all_objects if coll else []):
+            o.select_set(True)
+            last = o
+        if last:
+            context.view_layer.objects.active = last
         return {"FINISHED"}
 
 
@@ -265,41 +331,73 @@ class OBLIVION2VMF_PT_panel(bpy.types.Panel):
 
     def draw(self, context):
         col = self.layout.column()
+        col.operator("oblivion2vmf.add_box", icon="MESH_CUBE")
+        col.operator("oblivion2vmf.select_collision", icon="RESTRICT_SELECT_OFF")
+        col.label(text="(then G move / R rotate as one)")
+        col.separator()
+        col.operator("oblivion2vmf.clear_import", icon="TRASH")
+        col.separator()
         col.operator("oblivion2vmf.save_collision", icon="EXPORT")
+        col.separator()
+        col.label(text="Ctrl+D dup, Ctrl+C/V copy/paste")
+        col.label(text="(new pieces join the group)")
         col.separator()
         for line in STATUS["msg"].split("\n"):
             col.label(text=line, icon="INFO")
 
 
-# Register the panel/operator FIRST and unconditionally, so the sidebar tab always
-# appears even if the reference import fails. (Importing first and letting an
-# exception abort the script is why the panel was missing on some Blender builds.)
+_CLASSES = (OBLIVION2VMF_OT_save, OBLIVION2VMF_OT_clear_import,
+            OBLIVION2VMF_OT_add_box, OBLIVION2VMF_OT_select, OBLIVION2VMF_PT_panel)
+
+# Register FIRST and unconditionally so the sidebar tab always appears even if the
+# reference import fails.
 try:
     bpy.ops.wm.read_factory_settings(use_empty=True)
 except Exception:
     pass
-for _c in (OBLIVION2VMF_OT_save, OBLIVION2VMF_PT_panel):
+for _c in _CLASSES:
     try:
         bpy.utils.register_class(_c)
     except Exception:
         traceback.print_exc()
 
-# Now import the reference as a locked wireframe — guarded so a failure can never
-# remove the panel. Identity axes (forward=-Y, up=Z) so the round trip isn't rotated.
+_get_coll(REF_COLL)
+_get_coll(COLL_COLL)
+
+# Import the prop into the 'reference' group as a locked wireframe — reference
+# ONLY, never exported. Guarded so a failure can't remove the panel. Identity axes
+# (forward=-Y, up=Z) so the round trip isn't rotated.
+_activate(REF_COLL)
 try:
     if hasattr(bpy.ops.wm, "obj_import"):          # Blender 4.x
         bpy.ops.wm.obj_import(filepath=REF_OBJ, forward_axis='NEGATIVE_Y', up_axis='Z')
     else:                                          # Blender 3.x
         bpy.ops.import_scene.obj(filepath=REF_OBJ, axis_forward='-Y', axis_up='Z')
     for o in list(bpy.context.selected_objects):
-        o.name = "reference"
+        o.name = "reference_" + o.name
         o.display_type = "WIRE"
         o.hide_select = True
 except Exception as exc:
     STATUS["msg"] = "Reference import FAILED:\n%s\nBuild collision anyway." % exc
     traceback.print_exc()
 
-# Pop the N sidebar open so the panel is visible without the user pressing N.
+# Make 'collision' the ACTIVE group so Add/duplicate(Ctrl+D)/paste(Ctrl+V) all land
+# there and get exported.
+_activate(COLL_COLL)
+
+# Keymaps: Ctrl+D = duplicate, Ctrl+C/Ctrl+V = copy/paste objects (best-effort).
+try:
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon or wm.keyconfigs.active
+    if kc is not None:
+        km = kc.keymaps.new(name="Object Mode", space_type='EMPTY')
+        km.keymap_items.new("object.duplicate_move", 'D', 'PRESS', ctrl=True)
+        km.keymap_items.new("view3d.copybuffer", 'C', 'PRESS', ctrl=True)
+        km.keymap_items.new("view3d.pastebuffer", 'V', 'PRESS', ctrl=True)
+except Exception:
+    traceback.print_exc()
+
+# Pop the N sidebar open so the panel is visible without pressing N.
 try:
     for area in bpy.context.screen.areas:
         if area.type == 'VIEW_3D':
