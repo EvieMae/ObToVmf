@@ -535,12 +535,20 @@ def cylinder_hull(bounds, sides=12):
 
 
 def plane_hull(bounds, thickness=2.0):
-    """A thin slab over the bounds XY footprint, from z0 to z0+thickness. Convex
-    physics pieces need volume — a zero-thickness quad is degenerate for
-    studiomdl — so 'plane' really means 'very flat box'."""
-    x0, y0, z0, x1, y1, _ = bounds
+    """A 'plane' is really a SMALL BOX: the bounds, but with any axis thinner than
+    ``thickness`` padded out (symmetrically) so the piece always has real 3D volume
+    on every axis. A near-zero-thickness convex piece (the old Z-only slab) is
+    degenerate for VPhysics and causes collision conflicts with neighbours; a small
+    box on the same footprint blocks cleanly."""
+    x0, y0, z0, x1, y1, z1 = (float(c) for c in bounds)
     t = max(0.1, float(thickness))
-    return box_hull((x0, y0, z0, x1, y1, z0 + t))
+    lo = [x0, y0, z0]
+    hi = [x1, y1, z1]
+    for a in range(3):                          # pad any too-thin axis to >= t
+        if hi[a] - lo[a] < t:
+            c = (lo[a] + hi[a]) / 2.0
+            lo[a], hi[a] = c - t / 2.0, c + t / 2.0
+    return box_hull((lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]))
 
 
 def _rotate_verts(verts, rot, centre):

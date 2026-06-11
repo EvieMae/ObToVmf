@@ -115,12 +115,18 @@ def test_cylinder_hull_rings_on_ellipse():
         assert {i for f in faces for i in f} == set(range(2 * sides))
 
 
-def test_plane_hull_thickness():
+def test_plane_hull_is_small_box():
+    # a plane is a small box: real extents kept, any too-thin axis padded so the
+    # convex piece always has 3D volume (no degenerate VPhysics conflicts)
     from oblivion2vmf.model import plane_hull, _BOX_FACES
     verts, faces = plane_hull((0, 0, 5, 10, 4, 100), thickness=2.0)
     assert faces == _BOX_FACES and len(verts) == 8
-    assert {v[2] for v in verts} == {5.0, 7.0}         # z0 .. z0+thickness, not z1
-    assert {(v[0], v[1]) for v in verts} == {(0, 0), (10, 0), (10, 4), (0, 4)}
+    assert {v[2] for v in verts} == {5.0, 100.0}        # thick Z kept (not flattened)
+    # flat in X (x0==x1, a wall) -> X padded to >= thickness about the plane
+    fv, _ = plane_hull((50, 0, 0, 50, 100, 80), thickness=2.0)
+    xs = {v[0] for v in fv}
+    assert xs == {49.0, 51.0}                            # padded +/-1 about x=50
+    assert max(v[1] for v in fv) - min(v[1] for v in fv) == 100   # Y kept
 
 
 def test_hull_from_spec_cylinder_plane_and_rot():
@@ -128,7 +134,7 @@ def test_hull_from_spec_cylinder_plane_and_rot():
     cyl = hull_from_spec({"type": "cylinder", "bounds": [0, 0, 0, 10, 10, 5], "sides": 8})
     assert cyl is not None and len(cyl[0]) == 16
     pl = hull_from_spec({"type": "plane", "bounds": [0, 0, 0, 10, 10, 50]})
-    assert pl is not None and {v[2] for v in pl[0]} == {0.0, 2.0}
+    assert pl is not None and {v[2] for v in pl[0]} == {0.0, 50.0}   # real box, not slab
     # rot [0,0,90] about the bounds centre (5,5,5): corner (0,0,0) -> (10,0,0)
     box = hull_from_spec({"type": "box", "bounds": [0, 0, 0, 10, 10, 10],
                           "rot": [0, 0, 90]})
