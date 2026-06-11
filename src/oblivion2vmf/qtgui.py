@@ -173,17 +173,45 @@ def _flow_row(items):
     return host
 
 
+def _steam_blender():
+    """The Steam Blender (steamapps/common/Blender/blender.exe), searching EVERY
+    Steam library — libraryfolders.vdf lists libraries on any drive. '' if none."""
+    import re
+    libs = [r"C:\Program Files (x86)\Steam", r"C:\Program Files\Steam"]
+    for base in list(libs):
+        vdf = os.path.join(base, "steamapps", "libraryfolders.vdf")
+        try:
+            with open(vdf, encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+            libs += [m.encode().decode("unicode_escape")
+                     for m in re.findall(r'"path"\s*"([^"]+)"', txt)]
+        except OSError:
+            pass
+    seen = set()
+    for lib in libs:
+        if lib in seen:
+            continue
+        seen.add(lib)
+        hits = glob.glob(os.path.join(lib, "steamapps", "common", "Blender",
+                                      "blender.exe"))
+        if hits:
+            return hits[0]
+    return ""
+
+
 def _find_blender():
-    """Best-effort blender.exe path: PATH, then the usual Windows install dirs."""
-    import glob
+    """blender.exe path, PREFERRING the Steam install (Steam ships a current
+    Blender with the OBJ importer + panel API we need), then PATH, then the newest
+    Blender Foundation install."""
     import shutil
+    steam = _steam_blender()
+    if steam:
+        return steam
     found = shutil.which("blender")
     if found:
         return found
-    pats = [r"C:\Program Files\Blender Foundation\Blender*\blender.exe",
-            r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe"]
-    hits = sorted(p for pat in pats for p in glob.glob(pat))
-    return hits[-1] if hits else ""
+    pf = sorted(glob.glob(r"C:\Program Files\Blender Foundation\Blender*\blender.exe"))
+    return pf[-1] if pf else ""
 
 
 # Bootstrap run inside Blender (`blender --python this -- ref.obj out.json`): loads
