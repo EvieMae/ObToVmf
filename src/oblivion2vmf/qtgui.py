@@ -600,7 +600,9 @@ class Main(QtWidgets.QMainWindow):
         self.model_src.setCurrentText(str(self.cfg.get("model_src", "Exterior")))
         top.addWidget(self.model_src)
         self.model_filter = QtWidgets.QLineEdit(str(self.cfg.get("model_filter", "")))
-        self.model_filter.setPlaceholderText("filter…")
+        self.model_filter.setPlaceholderText("search loaded models (.nif path or .mdl name)…")
+        self.model_filter.setClearButtonEnabled(True)
+        self.model_filter.textChanged.connect(self._apply_table_filter)   # live search
         top.addWidget(self.model_filter, 1)
         for lab, fn in [("Scan", self._scan_models), ("Load compiled", self._load_compiled),
                         ("Save overrides", self._save_overrides), ("Export…", self._export_data)]:
@@ -949,8 +951,7 @@ class Main(QtWidgets.QMainWindow):
             a += ["--interior", self.interiors[row][0]]
         else:
             a.append("--cells=" + v["cells"].replace(" ", ""))
-        if self.model_filter.text().strip():
-            a.append(self.model_filter.text().strip())
+        # load EVERY model; the search box live-filters the table afterwards
         self._append("Scanning models…")
         self._capture(a, self._set_models_text)
 
@@ -989,8 +990,8 @@ class Main(QtWidgets.QMainWindow):
                 self._append("Repaired corrupt build cache (%d entries kept)." % len(data))
             except Exception:
                 pass
-        filt = self.model_filter.text().strip().lower()
-        models = [(m, 0) for m in sorted(data) if not filt or filt in m.lower()]
+        # load EVERY compiled model; the search box live-filters the table afterwards
+        models = [(m, 0) for m in sorted(data)]
         self._fill_table(models, "compiled" if strict is not None
                          else "compiled, SALVAGED corrupt cache")
 
@@ -1045,15 +1046,34 @@ class Main(QtWidgets.QMainWindow):
                         sum(1 for k in self.model_rows if k.lower() in saved)))
         self._apply_table_filter()
 
+    @staticmethod
+    def _filter_norm(s):
+        """Normalise for matching: lowercase, drop path separators / underscores and
+        the .nif/.mdl extensions, so the SAME query matches a model whether you type
+        its .nif path (architecture\\foo\\bar.nif), its compiled .mdl slug
+        (architecture_foo_bar.mdl / models/oblivion2vmf/...), or just 'bar'."""
+        s = s.lower()
+        for junk in ("models/oblivion2vmf/", "models\\oblivion2vmf\\", ".nif", ".mdl"):
+            s = s.replace(junk, "")
+        return s.replace("\\", "").replace("/", "").replace("_", "").replace(" ", "")
+
     def _apply_table_filter(self, *_):
-        """When 'Hide … isn't (global)' is on, hide every row whose collision combo
-        is set to something other than (global) — i.e. show only the models you
-        haven't configured yet."""
-        hide = getattr(self, "hide_set", None) is not None and self.hide_set.isChecked()
+        """Hide rows that don't match the search box, and (when 'Hide … isn't
+        (global)' is on) rows already configured. The search matches the model's
+        .nif path OR its compiled .mdl slug, separators/extension ignored."""
+        from .model import slugify
+        hide_global = getattr(self, "hide_set", None) is not None and self.hide_set.isChecked()
+        flt = self._filter_norm(self.model_filter.text())
         for r in range(self.table.rowCount()):
             w = self.table.cellWidget(r, 1)
             coll = w.currentText() if w is not None else "(global)"
-            self.table.setRowHidden(r, hide and coll != "(global)")
+            hidden = hide_global and coll != "(global)"
+            if flt and not hidden:
+                item = self.table.item(r, 0)
+                modl = item.data(Qt.UserRole) if item else ""
+                hay = self._filter_norm(modl) + self._filter_norm(slugify(modl))
+                hidden = flt not in hay
+            self.table.setRowHidden(r, hidden)
 
     def _selected_model(self):
         it = self.table.item(self.table.currentRow(), 0)
