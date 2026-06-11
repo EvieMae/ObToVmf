@@ -1338,6 +1338,12 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
         m_ramp = ov.get("ramp_axis") or ramp_axis
         m_scale = scale * float(ov.get("scale", 1.0) or 1.0)
         m_surf = ov.get("surfaceprop") or "default"
+        # Hand-authored hull collision is baked from the override at compile time via
+        # build LOGIC the cache signature can't capture (e.g. the plane->box rule), so
+        # a cached .mdl can serve stale collision. NEVER cache hull models — always
+        # recompile, never store an entry.
+        model_uses_hulls = (m_collision == "hulls")
+        use_cache_model = use_cache and not model_uses_hulls
         try:
             data = source.get_mesh(modl)
             if data is None:
@@ -1345,7 +1351,7 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 return res
             # cache hit: signature matches and the compiled .mdl is still on disk
             sig = _sig(data, ov)
-            if use_cache and compile_models and gamedir:
+            if use_cache_model and compile_models and gamedir:
                 ent = cache.get(modl)
                 if (ent and ent.get("sig") == sig
                         and os.path.exists(os.path.join(gamedir, model_path))):
@@ -1368,7 +1374,9 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
             # cache-rebuild mode: don't recompile; just re-derive the cache entry
             # from the existing compiled .mdl (sig + textures), skipping CoACD/studiomdl.
             if cache_rebuild:
-                if gamedir and os.path.exists(os.path.join(gamedir, model_path)):
+                if model_uses_hulls:
+                    res["model_path"] = model_path   # hull models are never cached
+                elif gamedir and os.path.exists(os.path.join(gamedir, model_path)):
                     res["model_path"] = model_path
                     res["cache_entry"] = {"sig": sig, "model_path": model_path,
                                           "textures": res["textures"], "collision": m_collision}
@@ -1509,10 +1517,14 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                                        % (slug, clog[-600:]))
                     # still map it — user can recompile the .qc
             res["model_path"] = model_path
-            if not res["failure"] and compile_models:
+            if not res["failure"] and compile_models and not model_uses_hulls:
                 res["cache_entry"] = {"sig": sig, "model_path": model_path,
                                       "textures": res["textures"], "collision": m_collision}
                 _commit(modl, res["cache_entry"])   # flush now -> kill-safe
+            elif model_uses_hulls and modl in cache:
+                # never keep a stale hull entry around
+                with cache_lock:
+                    cache.pop(modl, None)
         except Exception as exc:
             res["failure"] = (modl, "exception: %r" % (exc,))
         return res
