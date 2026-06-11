@@ -104,6 +104,9 @@ ACD_MAX_CONCURRENCY = 6
 # 14 = Havok collision transforms (node world @ bhkRigidBodyT @ transform shapes)
 #      + list/packed/convex/box shapes — fixes 90-degree-rotated collision.
 GEOM_REV = 14
+# inset (world units) applied to authored hull / havok collision pieces so corners
+# that snap to the same room edges don't weld+merge in studiomdl into a sloped hull.
+HULL_GAP = 0.5
 ACD_TIMEOUT = 50            # seconds before a CoACD attempt is abandoned
 ACD_COARSE_THRESHOLD = 0.4  # fast retry threshold for meshes too slow at the fine one
 # Convert a desired LOD switch distance (Hammer units) to studiomdl's $lod screen
@@ -174,12 +177,35 @@ def write_smd(submeshes, path, scale=1.0, default_material=PLACEHOLDER_MATERIAL,
     return tri_count
 
 
-def write_collision_smd(parts, path, scale=1.0, material="phys"):
+def _inset_part(verts, gap):
+    """Shrink a convex part toward its own centroid by ``gap`` world units so its
+    corners no longer COINCIDE with neighbouring parts. studiomdl welds coincident
+    vertices and then convex-hulls the connected result — without this, hull pieces
+    snapped to the same room corners merge into one hull with diagonal 'slope'
+    faces. A sub-unit gap is invisible to the player but keeps each piece separate."""
+    n = len(verts)
+    cx = sum(v[0] for v in verts) / n
+    cy = sum(v[1] for v in verts) / n
+    cz = sum(v[2] for v in verts) / n
+    out = []
+    for x, y, z in verts:
+        dx, dy, dz = x - cx, y - cy, z - cz
+        d = (dx * dx + dy * dy + dz * dz) ** 0.5
+        f = (d - gap) / d if d > gap else 0.0     # move each vert `gap` inward
+        out.append((cx + dx * f, cy + dy * f, cz + dz * f))
+    return out
+
+
+def write_collision_smd(parts, path, scale=1.0, material="phys", gap=0.0):
     """Write convex parts [(verts, faces)] as a collision SMD (one element per
-    part). studiomdl turns each separate element into one convex hull."""
+    part). studiomdl turns each separate element into one convex hull. ``gap`` insets
+    each part toward its centroid (world units, pre-scale) so parts that share corners
+    don't get welded+merged into a single sloped hull."""
     out = ["version 1", "nodes", '0 "root" -1', "end",
            "skeleton", "time 0", "0 0 0 0 0 0 0", "end", "triangles"]
     for verts, faces in parts:
+        if gap > 0:
+            verts = _inset_part(verts, gap)
         for a, b, c in faces:
             out.append(material)
             for vi in (a, b, c):
@@ -1430,7 +1456,8 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 parts = [p for p in (hull_from_spec(s) for s in (ov.get("hulls") or []))
                          if p is not None]
                 if parts:
-                    write_collision_smd(parts, phys, scale=1.0)
+                    # gap so corner-snapped hulls don't weld+merge into a sloped hull
+                    write_collision_smd(parts, phys, scale=1.0, gap=HULL_GAP)
                     coll_smd, maxc = phys, max(64, len(parts) + 8)
                 elif ov.get("acd_parts"):
                     res["logs"].append("    %s: hulls mode, no hulls defined -> NO "
@@ -1458,7 +1485,7 @@ def build_models(base_models, placements, source, work_dir, scale=1.0,
                 hsubs = simplify_collision(coll_subs, target_tris=1000)
                 parts = coplanar_convex_pieces(hsubs, jobs=1) or []
                 if parts:
-                    write_collision_smd(parts, phys, scale=m_scale)
+                    write_collision_smd(parts, phys, scale=m_scale, gap=HULL_GAP)
                     coll_smd, maxc = phys, max(64, len(parts) + 8)
             elif m_collision in ("bbox", "ramp"):
                 # Single convex primitive sized to the mesh bounds: a box (cheap
