@@ -431,10 +431,15 @@ class Main(QtWidgets.QMainWindow):
 
         self._apply_dark()
 
-        # hull-edit undo/redo (scoped to the 3D editor's hull state)
+        # hull-edit undo/redo + copy/paste/duplicate (scoped to the 3D editor; each
+        # hands control back to a focused text field so normal text editing works)
         QtGui.QShortcut(QtGui.QKeySequence.Undo, self, activated=self._undo)
         QtGui.QShortcut(QtGui.QKeySequence.Redo, self, activated=self._redo)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Y"), self, activated=self._redo)
+        QtGui.QShortcut(QtGui.QKeySequence.Copy, self, activated=self._copy_hull)
+        QtGui.QShortcut(QtGui.QKeySequence.Paste, self, activated=self._paste_hull)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+D"), self, activated=self._duplicate_hull)
+        self._hull_clip = None
 
     # ---- field registry helpers ----
     def _edit(self, name, default="", browse=None, width=None):
@@ -720,6 +725,29 @@ class Main(QtWidgets.QMainWindow):
             tf.addRow(lab, w)
         sv.addWidget(tg)
 
+        # move ALL hulls together (fix an import/placement offset without re-editing)
+        og = QtWidgets.QGroupBox("Move all hulls (offset)")
+        of = QtWidgets.QVBoxLayout(og)
+        orow = QtWidgets.QHBoxLayout()
+        self.off_x = QtWidgets.QDoubleSpinBox()
+        self.off_y = QtWidgets.QDoubleSpinBox()
+        self.off_z = QtWidgets.QDoubleSpinBox()
+        for s in (self.off_x, self.off_y, self.off_z):
+            s.setRange(-1e6, 1e6)
+            s.setDecimals(2)
+            s.setSingleStep(8.0)
+            s.setMaximumWidth(64)
+            orow.addWidget(s)
+        of.addLayout(orow)
+        ob = QtWidgets.QPushButton("Move all by X/Y/Z")
+        ob.clicked.connect(self._offset_all_hulls)
+        of.addWidget(ob)
+        cb = QtWidgets.QPushButton("Clear ALL hulls")
+        cb.clicked.connect(self._clear_all_hulls)
+        of.addWidget(cb)
+        of.addWidget(QtWidgets.QLabel("Ctrl+C/V copy·paste, Ctrl+D duplicate"))
+        sv.addWidget(og)
+
         # face mode: click a face on the selected hull, then push/scale it
         fg = QtWidgets.QGroupBox("Face mode")
         ff = QtWidgets.QFormLayout(fg)
@@ -769,6 +797,7 @@ class Main(QtWidgets.QMainWindow):
                         ("Add trapezium", lambda: self._add_hull("trap")),
                         ("Add cylinder", lambda: self._add_hull("cylinder")),
                         ("Add plane", lambda: self._add_hull("plane")),
+                        ("Duplicate", self._duplicate_hull),
                         ("Remove", self._remove_box),
                         ("Fit to model", self._fit_box),
                         ("Save hulls → row", self._commit_hulls),
@@ -2294,6 +2323,99 @@ class Main(QtWidgets.QMainWindow):
         self._undo_stack.append(self._hull_state())
         self._restore_state(self._redo_stack.pop())
         self._append("redo: %d hull(s)" % len(self.boxes))
+
+    # ---- copy / paste / duplicate / clear / move-as-one ----
+    def _entry_snapshot(self, e):
+        """One hull entry as a widget-free, deep-copied dict (clipboard/duplicate)."""
+        d = {}
+        for k, v in e.items():
+            if k in ("widget", "actor", "name"):
+                continue
+            if isinstance(v, (list, tuple)):
+                d[k] = json.loads(json.dumps(list(v)))
+            elif isinstance(v, (str, int, float, bool)):
+                d[k] = v
+        return d
+
+    def _spawn_snapshot(self, s, offset=(0.0, 0.0, 0.0)):
+        """Spawn a hull from a snapshot, shifted by (dx,dy,dz) world units."""
+        dx, dy, dz = offset
+        b = list(s.get("bounds", (0, 0, 0, 0, 0, 0)))   # VTK order xmin,xmax,ymin,..
+        b = [b[0] + dx, b[1] + dx, b[2] + dy, b[3] + dy, b[4] + dz, b[5] + dz]
+        verts = s.get("verts")
+        if verts:
+            verts = [[v[0] + dx, v[1] + dy, v[2] + dz] for v in verts]
+        self._spawn_box(tuple(b), s.get("type", "box"), s.get("axis", "+x"),
+                        s.get("top_scale", 0.5), sides=s.get("sides", 12),
+                        rot=s.get("rot", (0, 0, 0)), verts=verts, faces=s.get("faces"))
+
+    def _duplicate_hull(self):
+        if self._focused_text_editor() is not None:
+            return
+        if self.plotter is None or self.cur_model is None or not self.boxes:
+            return
+        i = self._hull_target()
+        if not (0 <= i < len(self.boxes)):
+            return
+        self._push_undo()
+        self._spawn_snapshot(self._entry_snapshot(self.boxes[i]), offset=(8, 8, 0))
+        self._select_hull(len(self.boxes) - 1)
+        self.plotter.render()
+        self._refresh_inspector()
+        self._append("duplicated hull -> %d total" % len(self.boxes))
+
+    def _copy_hull(self):
+        fw = self._focused_text_editor()
+        if fw is not None:                          # let text fields copy normally
+            fw.copy()
+            return
+        if self.boxes:
+            i = self._hull_target()
+            if 0 <= i < len(self.boxes):
+                self._hull_clip = self._entry_snapshot(self.boxes[i])
+                self._append("copied hull (Ctrl+V to paste)")
+
+    def _paste_hull(self):
+        fw = self._focused_text_editor()
+        if fw is not None:
+            fw.paste()
+            return
+        if self._hull_clip is None or self.plotter is None or self.cur_model is None:
+            return
+        self._push_undo()
+        self._spawn_snapshot(self._hull_clip, offset=(8, 8, 0))
+        self._select_hull(len(self.boxes) - 1)
+        self.plotter.render()
+        self._refresh_inspector()
+        self._append("pasted hull -> %d total" % len(self.boxes))
+
+    def _clear_all_hulls(self):
+        if self.plotter is None or not self.boxes:
+            return
+        self._push_undo()
+        self._clear_boxes()
+        self.plotter.render()
+        self._refresh_inspector()
+        self._append("cleared all hulls (Ctrl+Z to undo)")
+
+    def _offset_all_hulls(self):
+        """Move EVERY hull together by (dx,dy,dz) — fixes an import/placement offset
+        without re-editing each piece."""
+        if self.plotter is None or not self.boxes:
+            return
+        dx, dy, dz = (self.off_x.value(), self.off_y.value(), self.off_z.value())
+        if not (dx or dy or dz):
+            return
+        self._push_undo()
+        for e in self.boxes:
+            b = e["bounds"]
+            e["bounds"] = (b[0] + dx, b[1] + dx, b[2] + dy, b[3] + dy, b[4] + dz, b[5] + dz)
+            if e.get("verts"):
+                e["verts"] = [[v[0] + dx, v[1] + dy, v[2] + dz] for v in e["verts"]]
+        self._respawn_boxes()
+        self._refresh_inspector()
+        self._append("offset all %d hull(s) by (%.1f, %.1f, %.1f)"
+                     % (len(self.boxes), dx, dy, dz))
 
     def _commit_hulls(self):
         if self.cur_model is None:
