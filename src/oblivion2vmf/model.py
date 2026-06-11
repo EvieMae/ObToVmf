@@ -100,8 +100,10 @@ ACD_MAX_CONCURRENCY = 6
 # 8 = weld + pyfqmr preserve_border; 9 = sooner switch distances;
 # 10 = LOD distances scale with model size; 11 = reproject LOD normals;
 # 12 = cap LOD count for big/multi-material models (GMod studiomdl LOD0 corruption);
-# 13 = split models over the 32768-vert mesh-batch limit into multiple $body SMDs.
-GEOM_REV = 13
+# 13 = split models over the 32768-vert mesh-batch limit into multiple $body SMDs;
+# 14 = Havok collision transforms (node world @ bhkRigidBodyT @ transform shapes)
+#      + list/packed/convex/box shapes — fixes 90-degree-rotated collision.
+GEOM_REV = 14
 ACD_TIMEOUT = 50            # seconds before a CoACD attempt is abandoned
 ACD_COARSE_THRESHOLD = 0.4  # fast retry threshold for meshes too slow at the fine one
 # Convert a desired LOD switch distance (Hammer units) to studiomdl's $lod screen

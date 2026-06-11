@@ -154,38 +154,147 @@ def extract_meshes(path_or_bytes):
     return out
 
 
-def extract_collision(path_or_bytes):
-    """Return the NIF's Havok collision as submeshes [{"verts","tris"}] in model
-    space (same coords as the render mesh), or None if it has no usable Havok
-    trimesh. This is the clean structural shell Bethesda authored for physics --
-    a better, lighter collision source than the detailed render mesh.
+# 1 Havok unit = 7 NIF/game units in Oblivion (rigid-body translations, transform
+# shapes, packed/convex/box shape coordinates are stored in Havok units; the verts
+# referenced by bhkNiTriStripsShape's NiTriStripsData are plain NIF units).
+HAVOK_SCALE = 7.0
 
-    Handles the common bhkNiTriStripsShape (MOPP-wrapped triangle mesh).
-    """
-    if not HAVE_PYFFI:
-        return None
-    data = _read(path_or_bytes)
-    for b in data.blocks:
-        if not isinstance(b, NifFormat.bhkRigidBody):
-            continue
-        sh = b.shape
-        seen = set()
-        # unwrap MOPP / transform wrappers down to the concrete shape
-        while sh is not None and not isinstance(sh, NifFormat.bhkNiTriStripsShape):
-            nxt = getattr(sh, "shape", None)
-            if nxt is None or id(sh) in seen:
-                break
-            seen.add(id(sh))
-            sh = nxt
-        if not isinstance(sh, NifFormat.bhkNiTriStripsShape):
-            continue
-        verts, tris = [], []
+
+def _quat_to_mat3(x, y, z, w):
+    return [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+
+
+def _hk_compose(parent, r, t):
+    rp, tp = parent
+    return (_mat3_mul(rp, r), [_mat3_vec(rp, t)[i] + tp[i] for i in range(3)])
+
+
+def _hk_apply(tf, v):
+    r, t = tf
+    rv = _mat3_vec(r, list(v))
+    return (rv[0] + t[0], rv[1] + t[1], rv[2] + t[2])
+
+
+def _hk_sub(tf, verts, tris):
+    return {"verts": [_hk_apply(tf, v) for v in verts],
+            "tris": list(tris), "normals": [], "uvs": [], "material": "phys"}
+
+
+def _hk_box(tf, hx, hy, hz, out):
+    corners = [(sx * hx, sy * hy, sz * hz)
+               for sz in (-1, 1) for sy in (-1, 1) for sx in (-1, 1)]
+    # any topology referencing all verts works — studiomdl convex-hulls the set
+    tris = [(0, 1, 3), (0, 3, 2), (4, 7, 5), (4, 6, 7),
+            (0, 5, 1), (0, 4, 5), (2, 3, 7), (2, 7, 6),
+            (0, 2, 6), (0, 6, 4), (1, 5, 7), (1, 7, 3)]
+    out.append(_hk_sub(tf, corners, tris))
+
+
+def _hk_walk(sh, tf, out, depth=0):
+    """Walk a Havok shape tree, composing transforms, appending one submesh per
+    concrete shape (so convex pieces stay separate)."""
+    if sh is None or depth > 16:
+        return
+    if isinstance(sh, NifFormat.bhkMoppBvTreeShape):
+        _hk_walk(sh.shape, tf, out, depth + 1)
+        return
+    if isinstance(sh, NifFormat.bhkListShape):
+        for s2 in sh.sub_shapes:
+            _hk_walk(s2, tf, out, depth + 1)
+        return
+    if isinstance(sh, (NifFormat.bhkTransformShape, NifFormat.bhkConvexTransformShape)):
+        m = sh.transform
+        # row-vector matrix -> transpose for our column convention; translation is
+        # the 4th ROW, in Havok units
+        r = [[m.m_11, m.m_21, m.m_31],
+             [m.m_12, m.m_22, m.m_32],
+             [m.m_13, m.m_23, m.m_33]]
+        t = [m.m_41 * HAVOK_SCALE, m.m_42 * HAVOK_SCALE, m.m_43 * HAVOK_SCALE]
+        _hk_walk(sh.shape, _hk_compose(tf, r, t), out, depth + 1)
+        return
+    if isinstance(sh, NifFormat.bhkNiTriStripsShape):
         for sd in sh.strips_data:
             if sd is None:
                 continue
-            base = len(verts)
-            verts.extend((v.x, v.y, v.z) for v in sd.vertices)
-            tris.extend((a + base, c + base, d + base) for a, c, d in sd.get_triangles())
-        if verts and tris:
-            return [{"verts": verts, "tris": tris, "normals": [], "uvs": [], "material": "phys"}]
-    return None
+            verts = [(v.x, v.y, v.z) for v in sd.vertices]          # NIF units
+            tris = [(a, c, d) for a, c, d in sd.get_triangles()]
+            if verts and tris:
+                out.append(_hk_sub(tf, verts, tris))
+        return
+    if isinstance(sh, NifFormat.bhkPackedNiTriStripsShape):
+        d = sh.data
+        if d is not None:
+            verts = [(v.x * HAVOK_SCALE, v.y * HAVOK_SCALE, v.z * HAVOK_SCALE)
+                     for v in d.vertices]
+            tris = [(t.triangle.v_1, t.triangle.v_2, t.triangle.v_3)
+                    for t in d.triangles]
+            if verts and tris:
+                out.append(_hk_sub(tf, verts, tris))
+        return
+    if isinstance(sh, NifFormat.bhkConvexVerticesShape):
+        verts = [(v.x * HAVOK_SCALE, v.y * HAVOK_SCALE, v.z * HAVOK_SCALE)
+                 for v in sh.vertices]
+        if len(verts) >= 4:
+            tris = [(0, i, i + 1) for i in range(1, len(verts) - 1)]  # fan; re-hulled
+            out.append(_hk_sub(tf, verts, tris))
+        return
+    if isinstance(sh, NifFormat.bhkBoxShape):
+        d = sh.dimensions                                            # half-extents
+        _hk_box(tf, d.x * HAVOK_SCALE, d.y * HAVOK_SCALE, d.z * HAVOK_SCALE, out)
+        return
+    if isinstance(sh, NifFormat.bhkSphereShape):
+        r = float(sh.radius) * HAVOK_SCALE
+        _hk_box(tf, r, r, r, out)                                    # box approx
+        return
+    # unknown shape type: ignore (better partial collision than none)
+
+
+def _collect_collision(block, world, out):
+    """Walk the scene graph accumulating node world transforms; for every node
+    carrying a bhkCollisionObject, extract its rigid body's shapes with the BODY
+    transform (bhkRigidBodyT) composed under the NODE's world transform — both are
+    needed: posts rotate via the body quaternion, paintings via the host node."""
+    if isinstance(block, NifFormat.NiAVObject):
+        world = _compose(world, _block_transform(block))
+        co = getattr(block, "collision_object", None)
+        body = getattr(co, "body", None) if co is not None else None
+        if body is not None and isinstance(body, NifFormat.bhkRigidBody):
+            tf = ([[1.0, 0, 0], [0, 1.0, 0], [0, 0, 1.0]], [0.0, 0.0, 0.0])
+            if isinstance(body, NifFormat.bhkRigidBodyT):
+                q = body.rotation
+                t = [body.translation.x * HAVOK_SCALE,
+                     body.translation.y * HAVOK_SCALE,
+                     body.translation.z * HAVOK_SCALE]
+                tf = (_quat_to_mat3(q.x, q.y, q.z, q.w), t)
+            pieces = []
+            _hk_walk(body.shape, tf, pieces)
+            for s in pieces:
+                s["verts"] = [_apply(world, v) for v in s["verts"]]
+                out.append(s)
+    if isinstance(block, NifFormat.NiNode):
+        for child in block.children:
+            if child is not None:
+                _collect_collision(child, world, out)
+
+
+def extract_collision(path_or_bytes):
+    """Return the NIF's Havok collision as submeshes [{"verts","tris"}] in model
+    space (same coords as the render mesh), or None if it has no usable Havok
+    geometry. This is the clean structural shell Bethesda authored for physics --
+    a better, lighter collision source than the detailed render mesh.
+
+    Composes (node world transform) @ (bhkRigidBodyT quaternion+translation, Havok
+    units x7) @ (transform-shape wrappers) — without these, models like basement
+    posts and paintings come back rotated 90 degrees. Handles MOPP/list wrappers,
+    (packed) tri-strip meshes, convex-vertex shapes, and box/sphere primitives;
+    each concrete shape becomes its own submesh. Animated models (anim NIFs) may
+    still mismatch — their collision rides animated nodes."""
+    if not HAVE_PYFFI:
+        return None
+    data = _read(path_or_bytes)
+    out = []
+    for root in data.roots:
+        _collect_collision(root, _identity(), out)
+    return out or None
