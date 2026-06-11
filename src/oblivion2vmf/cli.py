@@ -97,6 +97,12 @@ def build_parser():
                      help="convert ONE interior cell (room) to a VMF: a sealed room shell "
                           "+ its placed objects as props + lights from placed LIGH refs. "
                           "Use --list-interiors to find the EDID. Needs --bsa/--data-dir.")
+    sel.add_argument("--rebuild-model", metavar="NIF",
+                     help="recompile ONE model by its .nif path (e.g. "
+                          "architecture/foo/bar.nif) and exit — fast iteration on a single "
+                          "prop's collision/settings without rebuilding the whole map. "
+                          "Uses the model flags (--collision/--model-overrides/etc) and "
+                          "needs --bsa/--data-dir + --studiomdl + --gamedir.")
     p.add_argument("--skybox-room", action="store_true",
                    help="(interiors) wrap the room in tools/toolsskybox instead of the "
                         "default sealed tools/toolsblack, so the enclosure renders the 2D "
@@ -319,6 +325,9 @@ def _parse_cells(text):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+
+    if args.rebuild_model:                     # single-model recompile, no ESM needed
+        return _rebuild_model(args)
 
     esm = args.esm or _find_default_esm()
     if not esm:
@@ -739,6 +748,54 @@ def _selection_models(args, esm, ws):
         raise SystemExit("--list-models needs --cells/--region or --interior.")
     ex = _parse_load_order(order, target_ws=ws, bounds=bounds, models=True)
     return ex.placements, ex.base_models
+
+
+def _rebuild_model(args):
+    """Recompile ONE model by its .nif path and exit. Fast single-prop iteration."""
+    from . import model as modelmod
+    from .bsa import DataSource
+    modl = args.rebuild_model.replace("/", "\\")
+    if not (args.bsa or args.data_dir):
+        raise SystemExit("--rebuild-model needs --bsa/--data-dir to read the .nif.")
+    studiomdl = modelmod.find_studiomdl(args.studiomdl)
+    gamedir = modelmod.find_gamedir(args.gamedir)
+    if not studiomdl or not gamedir:
+        raise SystemExit("--rebuild-model needs --studiomdl and --gamedir to compile "
+                         "(studiomdl=%s, gamedir=%s)." % (studiomdl, gamedir))
+    source = DataSource(data_dir=args.data_dir, bsa_paths=args.bsa)
+    out_parent = os.path.dirname(os.path.abspath(args.out))
+    work_dir = os.path.join(out_parent, "models_src")
+    os.makedirs(work_dir, exist_ok=True)
+    # one synthetic placement so build_models processes exactly this mesh
+    base_models = {0x1: modl}
+    placements = {(0, 0): [{"base": 0x1, "pos": (0.0, 0.0, 0.0),
+                            "rot": (0.0, 0.0, 0.0), "scale": 1.0}]}
+    print("Rebuilding %s (collision=%s)…" % (modl, args.collision))
+    model_map, mstats = modelmod.build_models(
+        base_models, placements, source, work_dir,
+        scale=args.scale, studiomdl=studiomdl, gamedir=gamedir, compile_models=True,
+        materials_root=os.path.join(out_parent, "materials"),
+        flip_winding=args.flip_winding, flip_v=args.flip_v,
+        collision=args.collision, collision_size=args.collision_size,
+        acd_threshold=args.acd_threshold, acd_max_hulls=args.acd_max_hulls,
+        ramp_axis=args.ramp_axis,
+        model_overrides=_load_model_overrides(args.model_overrides),
+        custom_fallback="havok", model_lods=args.model_lods, trees=False, jobs=1,
+        use_cache=args.cache)
+    if not model_map:
+        raise SystemExit("Failed: '%s' not found in the BSA/data dir, or no geometry. "
+                         "Check the .nif path." % modl)
+    print("  %d converted, %d failed, %d textures"
+          % (mstats["converted"], mstats["failed"], mstats["textures"]))
+    for m, reason in mstats["failures"][:5]:
+        print("    - %s: %s" % (m, reason))
+    mats = os.path.join(out_parent, "materials")
+    if os.path.isdir(mats):
+        n = _copy_tree_into(mats, os.path.join(gamedir, "materials"))
+        print("  materials: %d file(s) -> %s\\materials\\" % (n, gamedir))
+    print("Done -> %s\\models\\%s\\%s.mdl"
+          % (gamedir, modelmod.MODEL_PREFIX, modelmod.slugify(modl)))
+    return 0
 
 
 def _list_models(args, esm, ws):

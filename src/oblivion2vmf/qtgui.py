@@ -725,6 +725,7 @@ class Main(QtWidgets.QMainWindow):
                         ("Remove", self._remove_box),
                         ("Fit to model", self._fit_box),
                         ("Save hulls → row", self._commit_hulls),
+                        ("Rebuild this model ⚙", self._rebuild_one_model),
                         ("Havok → exact pieces", self._havok_exact_pieces),
                         ("Havok → all (parallel)", self._havok_all_parallel),
                         ("Import NIF collision", self._import_nif_collision),
@@ -2250,6 +2251,22 @@ class Main(QtWidgets.QMainWindow):
         if hulls:
             self.model_rows[self.cur_model]["collision"].setCurrentText("hulls")
         self._append("%s: %d hull(s) set (now Save overrides)." % (self.cur_model, len(hulls)))
+
+    def _rebuild_one_model(self):
+        """Recompile just the selected model via --rebuild-model (fast iteration).
+        Saves overrides first so the build sees your latest hull edits."""
+        modl = self.cur_model or self._selected_model()
+        if not modl:
+            self._append("Select a model row first.")
+            return
+        self._save_overrides()                  # bake current edits to the JSON
+        v = self._vals()
+        a = _common_args(v, self.plugin_list, self.bsa_list)
+        a += ["--rebuild-model", modl, "--out", v["out"], "--scale", v["scale"]]
+        a += _model_args(v)
+        self._save_cfg()
+        self._run_stream(a, on_finish=lambda code: self._append(
+            "Rebuilt %s (exit %d)." % (os.path.basename(modl), code)))
 
     def _havok_exact_pieces(self):
         """Exact collision from the NIF's Havok shell: coplanar faces -> convex
